@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from html import escape
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -10,7 +11,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand, BotCommandScopeAllChatAdministrators, BotCommandScopeChat, BotCommandScopeDefault,
-    BufferedInputFile, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup,
+    BufferedInputFile, InputMediaDocument, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup,
     Message, MessageEntity,
 )
 from aiogram.exceptions import (
@@ -26,6 +27,7 @@ from aiogram.enums import ParseMode
 from .config import (
     BOT_TOKEN, ADMIN_IDS, POLL_SECONDS, BATCH_SIZE, DEFAULT_INTERVAL_MINUTES, POST_DELAY_SECONDS,
     TIMEZONE, QUIET_START_HOUR, QUIET_END_HOUR, LOW_POST_THRESHOLD, DAILY_REPORT_HOUR, MAX_IMPORT_RANGE,
+    BACKUP_DELAY_SECONDS, AUTO_SNAPSHOT_HOURS, MAX_RESTORE_RANGE, DESTINATION_IDS, BACKUP_CHANNEL_ID,
 )
 from . import storage
 from .media import watermark_image
@@ -176,7 +178,7 @@ def origin_ref(message: Message):
     return message.chat.id, message.message_id
 
 
-def queue_post(message: Message, assign: bool = True):
+def queue_post(message: Message, assign: bool = True, imported: bool = False):
     entities = [e.model_dump(exclude_none=True) for e in (message.entities or [])]
     caption_entities = [e.model_dump(exclude_none=True) for e in (message.caption_entities or [])]
     payload = json.dumps({"text": entities, "caption": caption_entities}, ensure_ascii=False)
@@ -185,7 +187,7 @@ def queue_post(message: Message, assign: bool = True):
     source_chat, source_message = origin_ref(message)
     return storage.add_post(
         source_chat, source_message, message.caption or message.text, payload, markup_json(message),
-        content_type, file_id, message.media_group_id, assign,
+        content_type, file_id, message.media_group_id, assign, imported,
     )
 
 
@@ -256,6 +258,7 @@ ADMIN_MENU = [
     ("channels", "Destinations: schedule, pending, next run"),
     ("stats", "Post counts: library, used, remaining"),
     ("addchannel", "Add a channel/group by ID or @username"),
+    ("addmany", "Add many channels/groups at once (IDs or @usernames)"),
     ("removechannel", "Remove a destination (tap to choose)"),
     ("setinterval", "Set wait time between batches"),
     ("setbatch", "Set posts per batch"),
@@ -268,6 +271,16 @@ ADMIN_MENU = [
     ("removesource", "Remove a source channel"),
     ("import_history", "Import old posts (forward or ID range)"),
     ("done", "Finish forward-import"),
+    ("delete_history", "Delete imported old posts (one/range/all)"),
+    ("detect", "Find channels/groups where the bot is already admin"),
+    ("railway_vars", "IDs to paste into Railway variables"),
+    ("setbackup", "Set the backup channel"),
+    ("backup", "Copy all posts into the backup channel"),
+    ("export_backup", "Get a backup file of the whole bot"),
+    ("import_backup", "Restore the bot from a backup file (owner)"),
+    ("restore_posts", "Re-post all backed-up posts into a channel"),
+    ("job", "Progress of the running backup/restore"),
+    ("stopjob", "Stop the running backup/restore"),
     ("setfooter", "Set footer text under posts"),
     ("clearfooter", "Remove footer"),
     ("setwatermark", "Set watermark text for photos"),
@@ -327,12 +340,24 @@ def help_text() -> str:
         "<b>Destinations (channels / groups)</b>\n"
         "Add the bot with an admin account (channel: as admin with 'Post messages'; group: as member) "
         "and it registers itself. Or: /addchannel -100… | @name, or /addhere inside a group/topic.\n"
+        "Many at once: /addmany then paste all IDs / @usernames (one per line).\n"
         "/channels · /removechannel · /removehere\n"
         "/setinterval · /setbatch · /pause · /resume  (CHAT_ID or all)\n\n"
         "<b>Sources &amp; old posts</b>\n"
         "/sources · /addsource -100… · /removesource -100…\n"
         "/import_history — forward old posts to the bot, then /done\n"
-        "/import_history SOURCE_ID FIRST_ID LAST_ID — add a range of old post IDs\n\n"
+        "/import_history SOURCE_ID FIRST_ID LAST_ID — add a range of old post IDs\n"
+        "/delete_history — remove imported posts: one ID, a range, per source, or all\n\n"
+        "<b>After a reset / redeploy</b>\n"
+        "Set BACKUP_CHANNEL_ID (and optionally DESTINATION_CHAT_IDS) in Railway: the bot then finds its channels "
+        "and settings by itself, no need to re-add it as admin. /detect runs the search now; /railway_vars shows "
+        "the values to paste.\n\n"
+        "<b>Backup &amp; restore</b>\n"
+        "/setbackup -100… — a private channel where the bot keeps a copy of every post\n"
+        "/backup — copy everything now (new posts are copied automatically)\n"
+        "/export_backup — settings + post list as a file (also sent daily to owners)\n"
+        "/restore_posts CHANNEL — post all backed-up posts into a (new) channel\n"
+        "/import_backup — reply to a backup file to rebuild the bot · /job · /stopjob\n\n"
         "<b>Counts &amp; alerts</b>\n"
         "/stats — posts, used, remaining, sent in 24h\n"
         f"Low-post alert at {LOW_POST_THRESHOLD} left; alert when all posts are used; "
@@ -468,6 +493,83 @@ async def add_channel_cmd(message: Message):
         f"Added {icon(chat.type)} <b>{escape(title)}</b> (<code>{chat.id}</code>{topic_note}): "
         f"up to {BATCH_SIZE} posts per batch, then every {interval} minute(s)."
     )
+
+
+@dp.message(Command("addmany"))
+async def add_many_cmd(message: Message):
+    """Add several destinations in one message: IDs (-100...) and/or @usernames, separated by lines/spaces/commas."""
+    if not is_admin(message):
+        return await deny(message)
+    parts = (message.text or "").split(maxsplit=1)
+    raw = parts[1] if len(parts) > 1 else ""
+    interval = DEFAULT_INTERVAL_MINUTES
+    refs: list = []
+    for token in [t for t in re.split(r"[,;|\s]+", raw) if t]:
+        timing = re.fullmatch(r"(?:interval|min|minutes)[=:]?(\d+)", token.lower())
+        if timing:
+            interval = max(1, int(timing.group(1)))
+        elif token.startswith("@") or re.fullmatch(r"-\d{5,}", token):
+            if token not in refs:
+                refs.append(token)
+        elif token.isdigit() and len(token) <= 5:
+            interval = max(1, int(token))
+    if not refs:
+        return await message.answer(
+            "Paste many chats in one message, one per line:\n"
+            "<code>/addmany\n-1001234567890\n-1009876543210\n@publicchannel</code>\n"
+            f"Optional: <code>interval=200</code> (minutes between batches, default {DEFAULT_INTERVAL_MINUTES}). "
+            "The bot must already be in each chat (channel: admin with 'Post messages')."
+        )
+
+    existing = {int(c["chat_id"]) for c in await db(storage.list_channels)}
+    me_id = (await bot.get_me()).id
+    added, skipped, failed = [], [], []
+    for ref in refs:
+        await asyncio.sleep(0.2)  # stay clear of Telegram flood limits
+        chat = await resolve_chat(ref)
+        if chat is None:
+            failed.append(f"❌ <code>{escape(ref)}</code> — cannot access it (wrong ID, or the bot is not there)")
+            continue
+        title = chat.title or str(chat.id)
+        if chat.type not in DEST_TYPES:
+            failed.append(f"❌ <b>{escape(title)}</b> <code>{chat.id}</code> — not a channel or group")
+            continue
+        if storage.is_source(chat.id):
+            failed.append(f"❌ <b>{escape(title)}</b> <code>{chat.id}</code> — this is a SOURCE channel")
+            continue
+        if chat.id in existing:
+            skipped.append(f"↩️ <b>{escape(title)}</b> <code>{chat.id}</code>")
+            continue
+        try:
+            me = await bot.get_chat_member(chat.id, me_id)
+        except TelegramAPIError:
+            failed.append(f"❌ <b>{escape(title)}</b> <code>{chat.id}</code> — cannot check my permissions there")
+            continue
+        if not bot_can_post(chat.type, me):
+            failed.append(f"❌ <b>{escape(title)}</b> <code>{chat.id}</code> — bot cannot post (make it admin with 'Post messages')")
+            continue
+        await db(storage.add_channel, chat.id, title, interval, chat.type, None)
+        existing.add(chat.id)
+        added.append(f"✅ {icon(chat.type)} <b>{escape(title)}</b> <code>{chat.id}</code>")
+
+    lines = [
+        f"<b>/addmany</b>: {len(added)} added · {len(skipped)} already there · {len(failed)} failed "
+        f"(every {interval} min, up to {BATCH_SIZE} posts per batch)"
+    ]
+    if added:
+        lines += [""] + added
+    if skipped:
+        lines += ["", "Already added (unchanged):"] + skipped
+    if failed:
+        lines += ["", "Not added:"] + failed
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500:
+            await message.answer(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        await message.answer(chunk)
 
 
 @dp.message(Command("addhere"), F.chat.type.in_(GROUP_TYPES))
@@ -641,13 +743,19 @@ def build_stats_text(title: str = "Statistics") -> str:
         lines.append(f"  • source {escape(s['title'])}: {s['posts']}")
     if data["manual"]:
         lines.append(f"  • added manually / forwarded: {data['manual']}")
+    backup_chat = storage.get_backup_chat()
+    if backup_chat:
+        done, total = storage.backup_counts(backup_chat)
+        lines.append(f"🗄 Backup channel: {done}/{total} post(s) backed up")
+    else:
+        lines.append("🗄 Backup channel: not set (/setbackup)")
     lines.append("")
     if not data["destinations"]:
         lines.append("No destinations registered.")
     for d in data["destinations"]:
         flag = " ⏸ paused" if d["paused"] else ""
         lines.append(
-            f"{icon(d['kind'])} <b>{escape(d['title'])}</b>{flag}\n"
+            f"{icon(d['kind'])} <b>{escape(d['title'])}</b> <code>{d['chat_id']}</code>{flag}\n"
             f"   sent 24h: {d['sent_24h']} · used {d['used']}/{data['total']} · "
             f"remaining {d['remaining']} · pending {d['pending']} · cycles {d['cycles']}"
         )
@@ -790,6 +898,7 @@ async def import_history_cmd(message: Message):
         "IDs that do not exist (deleted posts, service messages) are cleaned out automatically the first "
         "time the bot tries to send them. Footer works on these posts only when the post is a photo/video "
         "that the bot saw live or you forwarded; watermark needs a post saved live or forwarded."
+        "\n\nChanged your mind? /delete_history removes imported posts again."
     )
 
 
@@ -805,6 +914,837 @@ async def done_cmd(message: Message):
         f"<b>Import finished</b>\nAdded: {session['added']}\nAlready saved (skipped): {session['dup']}\n"
         f"Library now: {library} post(s)."
     )
+
+
+@dp.message(Command("delete_history"))
+async def delete_history_cmd(message: Message):
+    """Remove imported old posts from the bot's library: one ID, an ID range, one source, or all imported."""
+    if not is_admin(message):
+        return await deny(message)
+    if message.chat.type != "private":
+        return await message.answer("Please use /delete_history in a private chat with the bot.")
+    args = command_args(message).lower().split()
+
+    if not args:
+        groups = await db(storage.imported_by_source)
+        total = sum(int(g["posts"]) for g in groups)
+        if not total:
+            return await message.answer("There are no imported posts to delete.")
+        rows = [
+            [InlineKeyboardButton(
+                text=f"🗑 {(g['title'] or 'forwarded / manual ' + str(g['chat_id']))[:30]} ({g['posts']})",
+                callback_data=f"dhq:s:{g['chat_id']}",
+            )]
+            for g in groups
+        ]
+        rows.append([InlineKeyboardButton(text=f"🗑 ALL imported ({total})", callback_data="dhq:a")])
+        rows.append([InlineKeyboardButton(text="Cancel", callback_data="dhn")])
+        return await message.answer(
+            "<b>Delete imported posts</b>\nTap what to delete:\n\n"
+            "One post or a range: <code>/delete_history SOURCE_ID ID</code> or "
+            "<code>/delete_history SOURCE_ID FIRST_ID LAST_ID</code>\n\n"
+            "This only removes posts from the bot. Nothing is deleted from your channels.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    confirm = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Yes, delete", callback_data="dhy:a"),
+        InlineKeyboardButton(text="Cancel", callback_data="dhn"),
+    ]])
+    if args == ["all"]:
+        count = await db(storage.count_history)
+        if not count:
+            return await message.answer("There are no imported posts to delete.")
+        return await message.answer(
+            f"Delete ALL <b>{count}</b> imported post(s) from the bot's library?\n"
+            "Posts collected live from your sources are kept.", reply_markup=confirm,
+        )
+
+    if len(args) not in (2, 3) or not all(a.lstrip("-").isdigit() for a in args[1:]) or args[1].startswith("-"):
+        return await message.answer(
+            "Format:\n<code>/delete_history</code> — choose from buttons\n"
+            "<code>/delete_history all</code>\n<code>/delete_history SOURCE_ID ID</code> — one post\n"
+            "<code>/delete_history SOURCE_ID FIRST_ID LAST_ID</code> — a range"
+        )
+    try:
+        source = int(args[0])
+    except ValueError:
+        chat = await resolve_chat(args[0])
+        source = chat.id if chat else None
+    if source is None:
+        return await message.answer("I cannot find that channel. Use its numeric ID (see /sources).")
+    first = int(args[1])
+    last = int(args[2]) if len(args) == 3 else first
+    if last < first:
+        return await message.answer("FIRST_ID must not be bigger than LAST_ID.")
+
+    count = await db(storage.count_history, source, first, last)
+    if not count:
+        return await message.answer("No saved posts with those IDs for that source.")
+    if first == last:  # a single post needs no confirmation
+        await db(storage.delete_history, source, first, last)
+        return await message.answer(f"Removed post {first} from the library. Nothing was deleted from the channel.")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Yes, delete", callback_data=f"dhy:r:{source}:{first}:{last}"),
+        InlineKeyboardButton(text="Cancel", callback_data="dhn"),
+    ]])
+    await message.answer(f"Delete <b>{count}</b> post(s) with IDs {first}-{last} of <code>{source}</code> from the library?", reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("dh"))
+async def delete_history_buttons(query: CallbackQuery):
+    if query.from_user.id not in all_admin_ids():
+        return await query.answer("Not authorized", show_alert=True)
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[0]
+    if action == "dhn":
+        await query.message.edit_text("Cancelled.")
+        return await query.answer()
+    try:
+        scope = parts[1]
+        source = first = last = None
+        if scope == "s":
+            source = int(parts[2])
+        elif scope == "r":
+            source, first, last = int(parts[2]), int(parts[3]), int(parts[4])
+        elif scope != "a":
+            return await query.answer()
+    except (ValueError, IndexError):
+        return await query.answer()
+
+    count = await db(storage.count_history, source, first, last)
+    if action == "dhq":
+        if scope == "a":
+            what = f"ALL <b>{count}</b> imported post(s)"
+        elif scope == "s":
+            what = f"<b>{count}</b> imported post(s) of <code>{source}</code>"
+        else:
+            what = f"<b>{count}</b> post(s) with IDs {first}-{last} of <code>{source}</code>"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Yes, delete", callback_data="dhy" + data[3:]),
+            InlineKeyboardButton(text="Cancel", callback_data="dhn"),
+        ]])
+        await query.message.edit_text(
+            f"Delete {what} from the bot's library?\n\n"
+            "Nothing is deleted from your channels, and posts already sent stay where they are.",
+            reply_markup=keyboard,
+        )
+    elif action == "dhy":
+        removed = await db(storage.delete_history, source, first, last)
+        library = await db(storage.library_size)
+        await query.message.edit_text(f"Removed {removed} post(s). Library now: {library} post(s).")
+    await query.answer()
+
+
+# ------------------------------------------------------- backup channel, snapshot file, restore
+
+JOB = {"task": None, "kind": "", "total": 0, "done": 0, "skipped": 0, "started": None}
+
+
+def is_missing_message(text: str) -> bool:
+    return "message to copy not found" in text or "message_id_invalid" in text or "can't be copied" in text
+
+
+async def can_post_in(chat_id: int):
+    """True / False if the bot can / cannot post in that chat; None when Telegram could not be reached."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        me = await bot.get_chat_member(chat_id, (await bot.get_me()).id)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return False
+    except TelegramAPIError:
+        return None
+    return bot_can_post(chat.type, me)
+
+
+async def source_unreachable(post, destination_id: int):
+    """The bot cannot read a post's source channel (and there is no backup copy): pause, warn once in a while."""
+    await db(storage.postpone_channel, destination_id, utc_in(minutes=30))
+    source = post["source_chat_id"]
+    key = f"srcalert:{source}"
+    last = await db(storage.get_setting, key)
+    if last is None or last < (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat():
+        await db(storage.set_setting, key, datetime.now(timezone.utc).isoformat())
+        await notify_admins(
+            f"⚠️ <b>Cannot read posts from</b> <code>{source}</code>\n"
+            "The bot was removed from that channel or the channel is gone. Sending of posts from it is paused "
+            "(will retry). Add the bot back there as admin, or restore your posts from the backup channel "
+            "with /restore_posts."
+        )
+
+
+def post_markup(post):
+    if not post["reply_markup_json"]:
+        return None
+    try:
+        return InlineKeyboardMarkup.model_validate_json(post["reply_markup_json"])
+    except Exception:
+        return None
+
+
+async def copy_safely(kwargs: dict):
+    """Copy one message with retries. Returns ('ok', new_message_id) | ('skip', None) | ('fatal', None)."""
+    destination = kwargs["chat_id"]
+    for _ in range(3):
+        try:
+            sent = await bot.copy_message(**kwargs)
+            return "ok", sent.message_id
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(int(exc.retry_after) + 1)
+        except TelegramMigrateToChat:
+            return "fatal", None
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            text = str(exc).lower()
+            if is_missing_message(text):
+                return "skip", None
+            if isinstance(exc, TelegramForbiddenError) or lost_access(exc):
+                return ("fatal", None) if await can_post_in(destination) is False else ("skip", None)
+            logging.warning("Copy rejected (%s)", exc)
+            return "skip", None
+        except TelegramAPIError:
+            logging.exception("Copy failed")
+            return "skip", None
+    return "skip", None
+
+
+async def backup_post(post, backup_chat: int) -> str:
+    kwargs = {"chat_id": backup_chat, "from_chat_id": post["source_chat_id"], "message_id": post["message_id"]}
+    markup = post_markup(post)
+    if markup:
+        kwargs["reply_markup"] = markup
+    outcome, new_id = await copy_safely(kwargs)
+    if outcome == "ok":
+        await db(storage.save_backup, post["id"], backup_chat, new_id)
+    return outcome
+
+
+async def maybe_backup_live(queue_id: int):
+    """A new post just arrived: copy it into the backup channel right away (if one is set)."""
+    try:
+        backup_chat = await db(storage.get_backup_chat)
+        if not backup_chat:
+            return
+        post = await db(storage.get_post, queue_id)
+        if post and post["source_chat_id"] != backup_chat:
+            await backup_post(post, backup_chat)
+    except Exception:
+        logging.exception("Live backup failed for post %s", queue_id)
+
+
+# ---- one background job at a time (backup or restore)
+
+def job_running() -> bool:
+    task = JOB["task"]
+    return task is not None and not task.done()
+
+
+def eta_text(items: int) -> str:
+    minutes = max(1, round(items * BACKUP_DELAY_SECONDS / 60))
+    return f"about {minutes} min" if minutes < 120 else f"about {minutes / 60:.1f} hours"
+
+
+async def tell(chat_id: int, text: str):
+    try:
+        await bot.send_message(chat_id, text)
+    except TelegramAPIError:
+        logging.warning("Could not send job message to %s", chat_id)
+
+
+async def run_backup_job(notify_chat: int, backup_chat: int):
+    posts = await db(storage.posts_needing_backup, backup_chat)
+    JOB.update(kind="Backup", total=len(posts), done=0, skipped=0, started=time.time())
+    if not posts:
+        return await tell(notify_chat, "Everything is already backed up. ✅")
+    await tell(notify_chat, f"📦 Backup started: {len(posts)} post(s), {eta_text(len(posts))}.\n/job shows progress, /stopjob stops it.")
+    fatal = False
+    try:
+        for i, post in enumerate(posts, 1):
+            outcome = await backup_post(post, backup_chat)
+            if outcome == "fatal":
+                fatal = True
+                break
+            JOB["done" if outcome == "ok" else "skipped"] += 1
+            if i % 250 == 0 and i < len(posts):
+                await tell(notify_chat, f"📦 Backup: {i}/{len(posts)}")
+            await asyncio.sleep(BACKUP_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        await tell(notify_chat, f"⏹ Backup stopped at {JOB['done']}/{JOB['total']}. Run /backup again to continue; finished posts are skipped.")
+        raise
+    if fatal:
+        return await tell(notify_chat, "❌ Backup stopped: the bot cannot post in the backup channel. Make it admin with 'Post messages', then run /backup again.")
+    await tell(notify_chat, f"✅ Backup finished: {JOB['done']} copied, {JOB['skipped']} skipped (posts that no longer exist).\nTip: /export_backup saves the settings and post list as a file.")
+
+
+async def run_restore_job(notify_chat: int, backup_chat: int, targets: list, items: list):
+    JOB.update(kind="Restore", total=len(items) * len(targets), done=0, skipped=0, started=time.time())
+    await tell(notify_chat, f"♻️ Restore started: {len(items)} post(s) → {len(targets)} destination(s), {eta_text(JOB['total'])}.\n/job shows progress, /stopjob stops it.")
+    last_mid = None
+    try:
+        for target in targets:
+            for index, (mid, markup_json) in enumerate(items, 1):
+                kwargs = {"chat_id": target["chat_id"], "from_chat_id": backup_chat, "message_id": mid}
+                if target.get("thread_id"):
+                    kwargs["message_thread_id"] = target["thread_id"]
+                if markup_json:
+                    try:
+                        kwargs["reply_markup"] = InlineKeyboardMarkup.model_validate_json(markup_json)
+                    except Exception:
+                        pass
+                outcome, _ = await copy_safely(kwargs)
+                if outcome == "fatal":
+                    await tell(notify_chat, f"❌ Cannot post in {target['title']} any more; skipping it.")
+                    JOB["skipped"] += len(items) - index + 1
+                    break
+                JOB["done" if outcome == "ok" else "skipped"] += 1
+                last_mid = mid
+                if index % 250 == 0 and index < len(items):
+                    await tell(notify_chat, f"♻️ {target['title']}: {index}/{len(items)}")
+                await asyncio.sleep(BACKUP_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        hint = ""
+        if len(targets) == 1 and last_mid:
+            hint = f"\nContinue later with /restore_posts {targets[0]['chat_id']} {last_mid + 1} {items[-1][0]}"
+        await tell(notify_chat, f"⏹ Restore stopped at {JOB['done']}/{JOB['total']}.{hint}")
+        raise
+    await tell(notify_chat, f"✅ Restore finished: {JOB['done']} posted, {JOB['skipped']} skipped.")
+
+
+def start_job(coro):
+    JOB["task"] = asyncio.create_task(coro)
+
+
+@dp.message(Command("job"))
+async def job_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    if not job_running():
+        return await message.answer("No backup or restore is running.")
+    elapsed = int(time.time() - JOB["started"])
+    await message.answer(
+        f"<b>{JOB['kind']}</b> running: {JOB['done']} done, {JOB['skipped']} skipped, of {JOB['total']} "
+        f"({elapsed // 60} min so far). /stopjob to stop."
+    )
+
+
+@dp.message(Command("stopjob"))
+async def stopjob_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    if not job_running():
+        return await message.answer("No backup or restore is running.")
+    JOB["task"].cancel()
+    await message.answer("Stopping…")
+
+
+@dp.message(Command("setbackup"))
+async def set_backup_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    args = command_args(message).split()
+    current = await db(storage.get_backup_chat)
+    if not args:
+        shown = f"Current backup channel: <code>{current}</code>\n\n" if current else "No backup channel set yet.\n\n"
+        return await message.answer(
+            shown + "Create a <b>private channel</b> just for backups, add this bot as admin ('Post messages'), then:\n"
+            "<code>/setbackup -1001234567890</code> (or @name)\n<code>/setbackup off</code> to stop using it."
+        )
+    if args[0].lower() in {"off", "none", "remove"}:
+        await db(storage.set_backup_chat, None)
+        return await message.answer("Backup channel unset. Copies already in it stay there.")
+    chat = await resolve_chat(args[0])
+    if chat is None or chat.type not in {"channel", "supergroup", "group"}:
+        return await message.answer("I cannot access that chat. Add the bot as admin there first.")
+    if storage.is_source(chat.id) or any(int(c["chat_id"]) == chat.id for c in await db(storage.list_channels)):
+        return await message.answer("The backup channel must be a separate channel, not a source or destination.")
+    if await can_post_in(chat.id) is not True:
+        return await message.answer("The bot cannot post there. Make it admin with 'Post messages'.")
+    await db(storage.set_backup_chat, chat.id)
+    done, total = await db(storage.backup_counts, chat.id)
+    await message.answer(
+        f"Backup channel set: <b>{escape(chat.title or str(chat.id))}</b> (<code>{chat.id}</code>).\n"
+        f"New posts are copied there automatically. {total - done} existing post(s) are not backed up yet — send /backup."
+    )
+
+
+@dp.message(Command("backup"))
+async def backup_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    if message.chat.type != "private":
+        return await message.answer("Please use /backup in a private chat with the bot.")
+    backup_chat = await db(storage.get_backup_chat)
+    if not backup_chat:
+        return await message.answer("Set a backup channel first: /setbackup")
+    if job_running():
+        return await message.answer("Another job is running. See /job.")
+    if await can_post_in(backup_chat) is not True:
+        return await message.answer("The bot cannot post in the backup channel. Check it is admin with 'Post messages'.")
+    start_job(run_backup_job(message.chat.id, backup_chat))
+
+
+async def build_snapshot():
+    def make():
+        data = storage.export_snapshot()
+        return json.dumps(data, ensure_ascii=False).encode("utf-8"), data
+    return await asyncio.to_thread(make)
+
+
+async def send_snapshot(chat_id: int, auto: bool = False):
+    blob, data = await build_snapshot()
+    if len(blob) > 45 * 1024 * 1024:
+        return await tell(chat_id, "The backup file would be larger than Telegram allows (50 MB).")
+    name = f"scheduler-backup-{datetime.now(TZ):%Y%m%d-%H%M}.json"
+    caption = (
+        f"{'Automatic ' if auto else ''}backup: {len(data['posts'])} posts, {len(data['sources'])} sources, "
+        f"{len(data['destinations'])} destinations.\nKeep this file. To rebuild the bot: send it to the new bot, "
+        "reply to it with /import_backup."
+    )
+    try:
+        await bot.send_document(chat_id, BufferedInputFile(blob, name), caption=caption)
+    except TelegramAPIError:
+        logging.warning("Could not send the backup file to %s", chat_id)
+
+
+@dp.message(Command("export_backup"))
+async def export_backup_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    if message.chat.type != "private":
+        return await message.answer("Please use /export_backup in a private chat with the bot.")
+    await send_snapshot(message.chat.id)
+
+
+async def maybe_auto_snapshot():
+    if AUTO_SNAPSHOT_HOURS <= 0:
+        return
+    last = await db(storage.get_setting, "snapshot_at")
+    if last and last > (datetime.now(timezone.utc) - timedelta(hours=AUTO_SNAPSHOT_HOURS)).isoformat():
+        return
+    await db(storage.set_setting, "snapshot_at", datetime.now(timezone.utc).isoformat())
+    if not await db(storage.library_size) and not await db(storage.list_channels):
+        return
+    for owner in ADMIN_IDS:
+        await send_snapshot(owner, auto=True)
+
+
+@dp.message(Command("import_backup"))
+async def import_backup_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    if not is_owner(message):
+        return await message.answer("Only the owner (ADMIN_IDS) can restore a backup file.")
+    document = message.document or (message.reply_to_message.document if message.reply_to_message else None)
+    if not document:
+        return await message.answer("Send the backup file to me, then reply to it with /import_backup.")
+    if (document.file_size or 0) > 19 * 1024 * 1024:
+        return await message.answer("That file is too big for a bot to download (20 MB limit).")
+    try:
+        raw = (await bot.download(document)).read()
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return await message.answer("I could not read that file. Send the original file made by /export_backup.")
+    try:
+        summary = await db(storage.import_snapshot, data)
+    except ValueError as exc:
+        return await message.answer(str(exc))
+
+    restored, rejoin = await restore_destinations(summary["destinations"])
+    lines = [
+        "<b>Backup restored</b>",
+        f"Posts: {summary['posts_added']} added, {summary['posts_existing']} already there",
+        f"Sources: {summary['sources']} · extra admins: {summary['admins']} · footer/watermark settings: {summary['settings']}",
+        f"Destinations re-added: {len(restored)}",
+    ]
+    if rejoin:
+        lines.append("Add the bot again (admin) to: " + ", ".join(escape(t) for t in rejoin))
+    sources = await db(storage.list_sources)
+    lines.append(
+        "Make the bot admin in your source channels so new posts are collected"
+        + (": " + ", ".join(escape(s["title"]) for s in sources) if sources else ".")
+    )
+    if await db(storage.get_backup_chat):
+        lines.append("Backup channel is set. If an original post is gone, its backup copy is used automatically.")
+    await message.answer("\n".join(lines))
+
+
+async def prepare_restore(token: str, first, last):
+    """-> (backup_chat, targets, items, error). first/last select message IDs in the backup channel."""
+    backup_chat = await db(storage.get_backup_chat)
+    if not backup_chat:
+        return None, None, None, "No backup channel set. Use /setbackup -100… first (the channel that holds your copies)."
+    if token == "all":
+        targets = [{"chat_id": int(c["chat_id"]), "title": c["title"], "thread_id": c["thread_id"]}
+                   for c in await db(storage.list_channels)]
+        if not targets:
+            return None, None, None, "No destinations registered."
+    else:
+        chat = await resolve_chat(token)
+        if chat is None or chat.type not in DEST_TYPES:
+            return None, None, None, "I cannot access that channel/group. Add the bot there as admin first."
+        if chat.id == backup_chat:
+            return None, None, None, "That is the backup channel itself."
+        if await can_post_in(chat.id) is not True:
+            return None, None, None, "The bot cannot post there. Make it admin with 'Post messages'."
+        targets = [{"chat_id": chat.id, "title": chat.title or str(chat.id), "thread_id": None}]
+
+    known = await db(storage.restore_items, backup_chat)
+    if first:
+        if last is None and known:
+            last = known[-1][0]
+        if last is None:
+            return None, None, None, "Give the last ID too: /restore_posts TARGET FIRST LAST"
+        if last < first:
+            return None, None, None, "FIRST must not be bigger than LAST."
+        if last - first + 1 > MAX_RESTORE_RANGE:
+            return None, None, None, f"Too many at once (max {MAX_RESTORE_RANGE}). Split the range."
+        markups = {mid: markup for mid, markup in known}
+        snapshot_msg = await db(storage.get_setting, "snapshot_msg")
+        items = [(mid, markups.get(mid)) for mid in range(first, last + 1) if str(mid) != str(snapshot_msg)]
+    else:
+        items = known
+        if not items:
+            return None, None, None, (
+                "The library has no backup copies. Restore by range instead: "
+                "/restore_posts TARGET FIRST LAST  (message IDs inside the backup channel)."
+            )
+    return backup_chat, targets, items, None
+
+
+@dp.message(Command("restore_posts"))
+async def restore_posts_cmd(message: Message):
+    """Post all backed-up posts into a channel/group (oldest first) - e.g. a new channel after a disaster."""
+    if not is_admin(message):
+        return await deny(message)
+    if message.chat.type != "private":
+        return await message.answer("Please use /restore_posts in a private chat with the bot.")
+    args = command_args(message).split()
+    if not args or len(args) > 3 or not all(a.isdigit() for a in args[1:]):
+        return await message.answer(
+            "<b>Restore posts</b>\n"
+            "<code>/restore_posts @channel</code> — every backed-up post, oldest first\n"
+            "<code>/restore_posts @channel FIRST LAST</code> — only message IDs FIRST..LAST of the backup channel\n"
+            "<code>/restore_posts all</code> — into every registered destination\n\n"
+            "Works even after a fresh install: run /setbackup with your backup channel, then use the range form."
+        )
+    if job_running():
+        return await message.answer("Another job is running. See /job.")
+    first = int(args[1]) if len(args) > 1 else None
+    last = int(args[2]) if len(args) > 2 else None
+    backup_chat, targets, items, error = await prepare_restore(args[0].lower(), first, last)
+    if error:
+        return await message.answer(error)
+    token = "all" if args[0].lower() == "all" else str(targets[0]["chat_id"])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Yes, restore", callback_data=f"rsy:{token}:{first or 0}:{last or 0}"),
+        InlineKeyboardButton(text="Cancel", callback_data="rsn"),
+    ]])
+    where = "every destination" if token == "all" else f"<b>{escape(targets[0]['title'])}</b>"
+    await message.answer(
+        f"Post <b>{len(items)}</b> backed-up post(s) into {where}"
+        + (f" ({len(targets)} destinations)" if token == "all" else "")
+        + f"? That takes {eta_text(len(items) * len(targets))}. They are plain copies (no footer/watermark), oldest first.",
+        reply_markup=keyboard,
+    )
+
+
+@dp.callback_query(F.data.startswith("rs"))
+async def restore_buttons(query: CallbackQuery):
+    if query.from_user.id not in all_admin_ids():
+        return await query.answer("Not authorized", show_alert=True)
+    parts = (query.data or "").split(":")
+    if parts[0] == "rsn":
+        await query.message.edit_text("Cancelled.")
+        return await query.answer()
+    if parts[0] != "rsy" or len(parts) != 4:
+        return await query.answer()
+    if job_running():
+        return await query.answer("Another job is running. See /job.", show_alert=True)
+    try:
+        first, last = int(parts[2]) or None, int(parts[3]) or None
+    except ValueError:
+        return await query.answer()
+    backup_chat, targets, items, error = await prepare_restore(parts[1], first, last)
+    if error:
+        await query.message.edit_text(error)
+        return await query.answer()
+    await query.message.edit_text("Restore is starting… you will get progress messages. /job · /stopjob")
+    start_job(run_restore_job(query.from_user.id, backup_chat, targets, items))
+    await query.answer()
+
+
+# ------------------------------------------------------- automatic detection after a reset
+
+async def restore_destinations(destinations: list):
+    """Re-register destinations from a snapshot where the bot can still post. Returns (restored, need_rejoin)."""
+    restored, rejoin = [], []
+    for d in destinations:
+        chat_id = int(d["chat_id"])
+        if storage.is_source(chat_id):
+            continue
+        if await can_post_in(chat_id):
+            await db(storage.add_channel, chat_id, d["title"], int(d["interval_minutes"]), d.get("kind") or "channel", d.get("thread_id"))
+            if d.get("batch_size"):
+                await db(storage.set_batch_size, chat_id, int(d["batch_size"]))
+            if d.get("paused"):
+                await db(storage.set_paused, chat_id, True)
+            restored.append(d["title"])
+        else:
+            rejoin.append(d["title"])
+    return restored, rejoin
+
+
+def snapshot_document(message):
+    document = getattr(message, "document", None) if message else None
+    if document and (document.file_name or "").startswith("scheduler-backup"):
+        return document
+    return None
+
+
+async def pinned_snapshot_message(backup_chat: int):
+    """The pinned snapshot message of the backup channel, or None."""
+    try:
+        chat = await bot.get_chat(backup_chat)
+    except TelegramAPIError:
+        return None
+    pinned = getattr(chat, "pinned_message", None)
+    return pinned if snapshot_document(pinned) else None
+
+
+async def read_pinned_snapshot(backup_chat: int):
+    """-> (message_id, data) from the snapshot pinned in the backup channel, or None."""
+    pinned = await pinned_snapshot_message(backup_chat)
+    if pinned is None:
+        return None
+    document = snapshot_document(pinned)
+    if (document.file_size or 0) > 19 * 1024 * 1024:
+        logging.warning("The pinned snapshot is too big for a bot to download")
+        return None
+    try:
+        raw = (await bot.download(document)).read()
+        return pinned.message_id, json.loads(raw.decode("utf-8"))
+    except (TelegramAPIError, ValueError):
+        logging.exception("Could not read the pinned snapshot")
+        return None
+
+
+async def auto_detect(extra_ids=(), force_snapshot: bool = False) -> list:
+    """Find everything the bot already belongs to, without anyone removing and re-adding it:
+    1) backup channel from BACKUP_CHANNEL_ID; 2) on a fresh install, the snapshot pinned in that channel
+    (sources, destinations, settings, posts); 3) chats listed in DESTINATION_CHAT_IDS (+ extra_ids).
+    Returns report lines (empty when nothing happened)."""
+    lines = []
+    if BACKUP_CHANNEL_ID and not await db(storage.get_backup_chat):
+        if await can_post_in(BACKUP_CHANNEL_ID):
+            await db(storage.set_backup_chat, BACKUP_CHANNEL_ID)
+            lines.append("• Backup channel set from BACKUP_CHANNEL_ID")
+        else:
+            lines.append(f"⚠️ BACKUP_CHANNEL_ID <code>{BACKUP_CHANNEL_ID}</code>: the bot cannot post there")
+    backup_chat = await db(storage.get_backup_chat)
+
+    fresh = not await db(storage.library_size) and not await db(storage.list_channels)
+    if backup_chat and (fresh or (force_snapshot and not await db(storage.get_setting, "snapshot_msg"))):
+        found = await read_pinned_snapshot(backup_chat)
+        if found:
+            message_id, data = found
+            try:
+                summary = await db(storage.import_snapshot, data)
+            except ValueError:
+                summary = None
+            if summary:
+                await db(storage.set_setting, "snapshot_msg", message_id)
+                restored, rejoin = await restore_destinations(summary["destinations"])
+                lines.append(
+                    f"• Snapshot restored: {summary['posts_added']} post(s), {summary['sources']} source(s), "
+                    f"{len(restored)} destination(s) (no re-adding needed)"
+                )
+                if rejoin:
+                    lines.append("⚠️ Bot is not admin any more in: " + ", ".join(escape(t) for t in rejoin))
+        elif fresh:
+            lines.append("• No snapshot found in the backup channel (nothing to restore yet)")
+
+    registered = {int(c["chat_id"]) for c in await db(storage.list_channels)}
+    for chat_id in sorted(DESTINATION_IDS | set(extra_ids)):
+        if chat_id in registered or storage.is_source(chat_id) or chat_id == backup_chat:
+            continue
+        if await can_post_in(chat_id):
+            try:
+                chat = await bot.get_chat(chat_id)
+                title, kind = chat.title or str(chat_id), chat.type
+            except TelegramAPIError:
+                title, kind = str(chat_id), "channel"
+            await db(storage.add_channel, chat_id, title, DEFAULT_INTERVAL_MINUTES, kind, None)
+            lines.append(f"• Found and added: {icon(kind)} {escape(title)} (<code>{chat_id}</code>)")
+        else:
+            lines.append(f"⚠️ <code>{chat_id}</code>: the bot cannot post there (not admin / removed)")
+    return lines
+
+
+@dp.message(Command("detect"))
+async def detect_cmd(message: Message):
+    """Look for channels/groups where the bot is already admin. Optional: extra chat IDs to check."""
+    if not is_admin(message):
+        return await deny(message)
+    extra = [int(t) for t in command_args(message).replace(",", " ").split() if t.lstrip("-").isdigit()]
+    lines = await auto_detect(extra, force_snapshot=True)
+    if not lines:
+        lines = ["Nothing new found."]
+    await message.answer(
+        "🔎 <b>Detect</b>\n" + "\n".join(lines)
+        + "\n\nThe bot cannot list its own chats. A channel/group that is missing: put its ID in "
+          "DESTINATION_CHAT_IDS (see /railway_vars), run <code>/detect -100…</code>, or just post something there "
+          "and I will ask you what to do."
+    )
+
+
+@dp.message(Command("railway_vars"))
+async def railway_vars_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    destinations = await db(storage.list_channels)
+    sources = sorted(storage.source_ids())
+    backup_chat = await db(storage.get_backup_chat)
+    lines = []
+    if backup_chat:
+        lines.append(f"BACKUP_CHANNEL_ID={backup_chat}")
+    lines.append("DESTINATION_CHAT_IDS=" + ",".join(str(c["chat_id"]) for c in destinations))
+    if sources:
+        lines.append("SOURCE_CHANNEL_IDS=" + ",".join(str(s) for s in sources))
+    await message.answer(
+        "<b>Paste these into Railway → Variables</b> once. After any reset or redeploy the bot then finds "
+        "these chats by itself (it must still be admin there).\n\n<code>" + "\n".join(lines) + "</code>"
+        + ("" if backup_chat else "\n\nNo backup channel yet: /setbackup is strongly recommended.")
+    )
+
+
+# ---- keep a fresh snapshot pinned in the backup channel (this is what makes recovery automatic)
+
+SNAPSHOT_CHECK_SECONDS = 600
+_snapshot_state = {"checked": 0.0, "warned": False}
+
+
+async def push_snapshot(backup_chat: int, message_id) -> bool:
+    blob, data = await build_snapshot()
+    if len(blob) > 45 * 1024 * 1024:
+        return False
+    name = "scheduler-backup-latest.json"
+    caption = (f"Automatic snapshot · {datetime.now(TZ):%d %b %Y %H:%M} · {len(data['posts'])} posts · "
+               f"{len(data['destinations'])} destinations. Do not delete or unpin: the bot restores itself from this file.")
+    if message_id:
+        try:
+            await bot.edit_message_media(
+                media=InputMediaDocument(media=BufferedInputFile(blob, name), caption=caption),
+                chat_id=backup_chat, message_id=int(message_id),
+            )
+            return True
+        except TelegramBadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            logging.info("Old snapshot message cannot be edited (%s); sending a new one", exc)
+    sent = await bot.send_document(backup_chat, BufferedInputFile(blob, name), caption=caption, disable_notification=True)
+    await db(storage.set_setting, "snapshot_msg", sent.message_id)
+    try:
+        await bot.pin_chat_message(backup_chat, sent.message_id, disable_notification=True)
+    except TelegramAPIError:
+        await notify_admins(
+            "⚠️ Give the bot the <b>'Pin messages'</b> permission in the backup channel. Without it the bot cannot "
+            "find its snapshot after a reset (recovery would not be automatic)."
+        )
+    return True
+
+
+async def maybe_push_snapshot():
+    if time.time() - _snapshot_state["checked"] < SNAPSHOT_CHECK_SECONDS:
+        return
+    _snapshot_state["checked"] = time.time()
+    backup_chat = await db(storage.get_backup_chat)
+    if not backup_chat:
+        return
+    if not await db(storage.library_size) and not await db(storage.list_channels):
+        return  # never overwrite a good snapshot with an empty state
+    fingerprint = await db(storage.state_fingerprint)
+    if fingerprint == await db(storage.get_setting, "snapshot_fp"):
+        return
+    message_id = await db(storage.get_setting, "snapshot_msg")
+    if not message_id and await pinned_snapshot_message(backup_chat) is not None:
+        # There is a snapshot in the channel that this bot has not loaded: never overwrite it.
+        if not _snapshot_state["warned"]:
+            _snapshot_state["warned"] = True
+            await notify_admins(
+                "⚠️ The backup channel already holds a snapshot that I have not loaded, so I will not overwrite it. "
+                "Run /detect to restore from it."
+            )
+        return
+    try:
+        if await push_snapshot(backup_chat, message_id):
+            await db(storage.set_setting, "snapshot_fp", fingerprint)
+    except TelegramAPIError:
+        logging.exception("Could not update the snapshot in the backup channel")
+
+
+# ---- a chat the bot belongs to but does not know yet
+
+PROMPTED: set = set()
+
+
+async def offer_unknown_chat(chat):
+    """Activity in a channel/group where the bot is a member but which is not set up: ask the admins once."""
+    cid = chat.id
+    if cid in PROMPTED or chat.type not in DEST_TYPES or storage.is_source(cid):
+        return
+    PROMPTED.add(cid)
+    if cid == await db(storage.get_backup_chat) or await db(storage.get_setting, f"ignored:{cid}"):
+        return
+    if any(int(c["chat_id"]) == cid for c in await db(storage.list_channels)) or not all_admin_ids():
+        return
+    title = chat.title or str(cid)
+    rows = [[InlineKeyboardButton(text="➕ Add as destination (posts go here)", callback_data=f"adc:{cid}")]]
+    if chat.type == "channel":
+        rows.append([InlineKeyboardButton(text="📥 Add as source (collect posts from it)", callback_data=f"ads:{cid}")])
+    rows.append([InlineKeyboardButton(text="🚫 Ignore", callback_data=f"adi:{cid}")])
+    for admin_id in all_admin_ids():
+        try:
+            await bot.send_message(
+                admin_id,
+                f"📡 I am in <b>{escape(title)}</b> (<code>{cid}</code>, {chat.type}) but it is not set up yet. "
+                "What should I do with it?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+        except TelegramAPIError:
+            pass
+
+
+@dp.callback_query(F.data.startswith("ad"))
+async def unknown_chat_buttons(query: CallbackQuery):
+    if query.from_user.id not in all_admin_ids():
+        return await query.answer("Not authorized", show_alert=True)
+    action, _, raw = (query.data or "").partition(":")
+    try:
+        cid = int(raw)
+    except ValueError:
+        return await query.answer()
+    if action == "adi":
+        await db(storage.set_setting, f"ignored:{cid}", "1")
+        await query.message.edit_text("Ignored. I will not ask about this chat again.")
+        return await query.answer()
+    chat = await resolve_chat(str(cid))
+    if chat is None or chat.type not in DEST_TYPES:
+        await query.message.edit_text("I cannot access that chat any more.")
+        return await query.answer()
+    title = chat.title or str(cid)
+    if action == "adc":
+        if await can_post_in(cid) is not True:
+            await query.message.edit_text("I cannot post there. For a channel, make me admin with 'Post messages'.")
+        else:
+            await db(storage.add_channel, cid, title, DEFAULT_INTERVAL_MINUTES, chat.type, None)
+            await query.message.edit_text(
+                f"Added <b>{escape(title)}</b> as a destination: up to {BATCH_SIZE} posts, then every "
+                f"{DEFAULT_INTERVAL_MINUTES} minutes."
+            )
+    elif action == "ads" and chat.type == "channel":
+        await db(storage.add_source, cid, title)
+        await query.message.edit_text(f"Added <b>{escape(title)}</b> as a source. New posts there are collected.")
+    await query.answer()
 
 
 # ------------------------------------------------------- footer and watermark
@@ -940,6 +1880,7 @@ async def admins_cmd(message: Message):
 @dp.channel_post()
 async def capture_source_channel_post(message: Message):
     if not storage.is_source(message.chat.id):
+        await offer_unknown_chat(message.chat)  # a channel where the bot is admin but which is not set up
         return
 
     content = (message.text or message.caption or "").strip()
@@ -956,6 +1897,7 @@ async def capture_source_channel_post(message: Message):
     qid = await db(queue_post, message)
     if qid:
         logging.info("Queued post %s from source %s", message.message_id, message.chat.id)
+        await maybe_backup_live(qid)
     else:
         logging.info("Source post %s already saved; ignored.", message.message_id)
 
@@ -971,13 +1913,20 @@ async def broadcast_private_cmd(message: Message):
 async def capture_admin_direct_post(message: Message):
     if not is_admin(message) or (message.text and message.text.startswith("/")):
         return
+    document = message.document
+    if document and (document.file_name or "").startswith("scheduler-backup"):
+        return await message.reply(
+            "Backup file received (not saved as a post). To restore from it, reply to this file with "
+            "/import_backup  (owner only)."
+        )
     session = IMPORTING.get(message.from_user.id)
     # While importing: save to the library only (no single destination queue) and stay quiet until /done.
-    qid = await db(queue_post, message, session is None)
+    qid = await db(queue_post, message, session is None, session is not None)
     if session is not None:
         session["added" if qid else "dup"] += 1
         return
     if qid:
+        await maybe_backup_live(qid)
         await message.reply("Post saved to the library and queued for one destination.")
     else:
         await message.reply("This post was already saved earlier.")
@@ -1109,20 +2058,30 @@ async def process_channel(channel):
             await db(storage.migrate_channel, chat_id, int(exc.migrate_to_chat_id))
             logging.info("Group %s upgraded to %s; schedule moved", chat_id, exc.migrate_to_chat_id)
             return
-        except TelegramForbiddenError:
-            await drop_channel(chat_id, channel["title"], "bot lost access or permission to post")
-            return
-        except TelegramBadRequest as exc:
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
             text = str(exc).lower()
-            if "message to copy not found" in text or "message_id_invalid" in text or "can't be copied" in text:
+            if is_missing_message(text):
+                if await db(storage.use_backup_copy, post["id"]):
+                    logging.info("Original of post %s is gone; now using its backup copy", post["id"])
+                    continue
                 logging.info("Source post %s no longer exists / cannot be copied; removing it", post["id"])
                 await db(storage.delete_post, post["id"])
                 continue
-            if lost_access(exc):
-                await drop_channel(chat_id, channel["title"], "chat not found or bot has no posting rights")
-                return
             if "thread not found" in text or ("topic" in text and "closed" in text):
                 await drop_channel(chat_id, channel["title"], "the target topic no longer exists or is closed")
+                return
+            if isinstance(exc, TelegramForbiddenError) or lost_access(exc):
+                # "chat not found" / "bot is not a member" can mean the DESTINATION or the SOURCE of this post.
+                verdict = await can_post_in(chat_id)
+                if verdict is False:
+                    await drop_channel(chat_id, channel["title"], "bot lost access or permission to post")
+                    return
+                if verdict is None:
+                    await db(storage.postpone_channel, chat_id, utc_in(minutes=1))
+                    return
+                if await db(storage.use_backup_copy, post["id"]):
+                    continue  # the source channel is unreachable, but the backup copy works
+                await source_unreachable(post, chat_id)
                 return
             logging.exception("Post %s rejected for %s; skipping it", post["id"], chat_id)
             await db(storage.finish_channel_post, chat_id, post["id"], False)
@@ -1167,6 +2126,8 @@ async def scheduler():
             if channel:
                 await process_channel(channel)
             await maybe_daily_report(now_local)
+            await maybe_auto_snapshot()
+            await maybe_push_snapshot()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1175,9 +2136,21 @@ async def scheduler():
         await asyncio.sleep(POLL_SECONDS)
 
 
+@dp.message(F.chat.type.in_(GROUP_TYPES))
+async def unknown_group_activity(message: Message):
+    """Last handler for groups: a message in a group that is not set up yet -> ask the admins once."""
+    await offer_unknown_chat(message.chat)
+
+
 async def main():
     await db(storage.init_db)
     await setup_command_menu()
+    try:
+        lines = await auto_detect()
+        if lines:
+            await notify_admins("🔎 <b>Auto-detect after start</b>\n" + "\n".join(lines))
+    except Exception:
+        logging.exception("Auto-detect failed")
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS is empty: nobody can use admin commands or auto-register chats.")
     if not storage.source_ids():

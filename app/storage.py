@@ -98,6 +98,7 @@ def init_db():
             content_type TEXT,
             file_id TEXT,
             media_group_id TEXT,
+            imported INTEGER NOT NULL DEFAULT 0,
             UNIQUE(source_chat_id, message_id)
         );
         CREATE TABLE IF NOT EXISTS channel_queue (
@@ -117,6 +118,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS sources (chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL, added_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS send_log (chat_id INTEGER NOT NULL, sent_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS backups (
+            queue_id INTEGER PRIMARY KEY,
+            backup_chat INTEGER NOT NULL,
+            backup_message_id INTEGER NOT NULL,
+            backed_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_send_log ON send_log(chat_id, sent_at);
         """)
         # Upgrade databases created by older versions.
@@ -131,7 +138,10 @@ def init_db():
             ("content_type", "TEXT"),
             ("file_id", "TEXT"),
             ("media_group_id", "TEXT"),
+            ("imported", "INTEGER NOT NULL DEFAULT 0"),
         ))
+        # Posts added by an ID-range import carry no content at all (older databases did not mark them).
+        db.execute("UPDATE queue SET imported=1 WHERE imported=0 AND content_type IS NULL AND entities_json IS NULL")
         # Sources from the environment variables are always present.
         for cid in SOURCE_IDS:
             db.execute("INSERT OR IGNORE INTO sources(chat_id,title,added_at) VALUES(?,?,?)", (cid, str(cid), _now()))
@@ -309,16 +319,16 @@ def _append_to_channel_queue(db, channel_id: int, queue_id: int):
 
 
 def add_post(source_chat_id: int, message_id: int, caption, entities_json, reply_markup_json,
-             content_type=None, file_id=None, media_group_id=None, assign: bool = True):
+             content_type=None, file_id=None, media_group_id=None, assign: bool = True, imported: bool = False):
     """Save a post in the library. With assign=True it is also given to ONE active destination (round-robin).
     Returns the new queue id, or None if this exact post was already saved."""
     with connection() as db:
         cur = db.execute(
             """INSERT OR IGNORE INTO queue(source_chat_id,message_id,caption,entities_json,reply_markup_json,
-                                           created_at,content_type,file_id,media_group_id)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
+                                           created_at,content_type,file_id,media_group_id,imported)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (source_chat_id, message_id, caption, entities_json, reply_markup_json, _now(),
-             content_type, file_id, media_group_id),
+             content_type, file_id, media_group_id, 1 if imported else 0),
         )
         if cur.rowcount == 0:
             return None
@@ -337,10 +347,49 @@ def add_posts_range(source_chat_id: int, first_id: int, last_id: int):
     rows = [(source_chat_id, mid, _now()) for mid in range(first_id, last_id + 1)]
     with connection() as db:
         cur = db.executemany(
-            "INSERT OR IGNORE INTO queue(source_chat_id,message_id,created_at) VALUES(?,?,?)", rows
+            "INSERT OR IGNORE INTO queue(source_chat_id,message_id,created_at,imported) VALUES(?,?,?,1)", rows
         )
         added = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     return added, len(rows) - added
+
+
+def _history_where(source_chat_id=None, first_id=None, last_id=None):
+    """WHERE clause + params selecting imported posts (optionally of one source), or a message-ID range
+    of one source (any post, imported or live)."""
+    if first_id is not None:
+        return "source_chat_id=? AND message_id BETWEEN ? AND ?", (source_chat_id, first_id, last_id)
+    if source_chat_id is not None:
+        return "imported=1 AND source_chat_id=?", (source_chat_id,)
+    return "imported=1", ()
+
+
+def count_history(source_chat_id=None, first_id=None, last_id=None) -> int:
+    where, params = _history_where(source_chat_id, first_id, last_id)
+    with connection() as db:
+        return db.execute(f"SELECT COUNT(*) FROM queue WHERE {where}", params).fetchone()[0]
+
+
+def imported_by_source():
+    """One row per source that has imported posts: chat_id, title (None for forwarded posts that belong to no
+    source) and the number of imported posts."""
+    with connection() as db:
+        return db.execute(
+            """SELECT q.source_chat_id AS chat_id, s.title AS title, COUNT(*) AS posts
+               FROM queue q LEFT JOIN sources s ON s.chat_id=q.source_chat_id
+               WHERE q.imported=1 GROUP BY q.source_chat_id ORDER BY s.title"""
+        ).fetchall()
+
+
+def delete_history(source_chat_id=None, first_id=None, last_id=None) -> int:
+    """Remove posts from the bot's library (and from every destination's queue/history).
+    Nothing is deleted from Telegram channels. Returns how many posts were removed."""
+    where, params = _history_where(source_chat_id, first_id, last_id)
+    with connection() as db:
+        ids = f"SELECT id FROM queue WHERE {where}"
+        db.execute(f"DELETE FROM channel_queue WHERE queue_id IN ({ids})", params)
+        db.execute(f"DELETE FROM channel_sent WHERE queue_id IN ({ids})", params)
+        db.execute(f"DELETE FROM backups WHERE queue_id IN ({ids})", params)
+        return db.execute(f"DELETE FROM queue WHERE {where}", params).rowcount
 
 
 def delete_post(queue_id: int):
@@ -349,6 +398,7 @@ def delete_post(queue_id: int):
         db.execute("DELETE FROM queue WHERE id=?", (queue_id,))
         db.execute("DELETE FROM channel_queue WHERE queue_id=?", (queue_id,))
         db.execute("DELETE FROM channel_sent WHERE queue_id=?", (queue_id,))
+        db.execute("DELETE FROM backups WHERE queue_id=?", (queue_id,))
 
 
 def _pick_random(db, channel_id: int, exclude_id=None):
@@ -540,3 +590,201 @@ def get_setting(key: str, default=None):
 def set_setting(key: str, value):
     with connection() as db:
         _put(db, key, value)
+
+
+# ------------------------------------------------------------ backup channel
+
+def get_backup_chat():
+    value = get_setting("backup_chat")
+    return int(value) if value else None
+
+
+def set_backup_chat(chat_id):
+    with connection() as db:
+        if chat_id is None:
+            db.execute("DELETE FROM settings WHERE key='backup_chat'")
+        else:
+            _put(db, "backup_chat", chat_id)
+
+
+def get_post(queue_id: int):
+    with connection() as db:
+        return db.execute("SELECT * FROM queue WHERE id=?", (queue_id,)).fetchone()
+
+
+def posts_needing_backup(backup_chat: int):
+    """Library posts that have no copy in the backup channel yet (copies already in it are skipped)."""
+    with connection() as db:
+        return db.execute(
+            """SELECT q.* FROM queue q LEFT JOIN backups b ON b.queue_id=q.id
+               WHERE b.queue_id IS NULL AND q.source_chat_id<>?
+               ORDER BY q.source_chat_id, q.message_id""",
+            (backup_chat,),
+        ).fetchall()
+
+
+def save_backup(queue_id: int, backup_chat: int, backup_message_id: int):
+    with connection() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO backups(queue_id,backup_chat,backup_message_id,backed_at) VALUES(?,?,?,?)",
+            (queue_id, backup_chat, backup_message_id, _now()),
+        )
+
+
+def backup_counts(backup_chat):
+    """(posts with a backup copy, posts that should have one)."""
+    with connection() as db:
+        if backup_chat is None:
+            return 0, db.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
+        total = db.execute("SELECT COUNT(*) FROM queue WHERE source_chat_id<>?", (backup_chat,)).fetchone()[0]
+        done = db.execute(
+            "SELECT COUNT(*) FROM queue q JOIN backups b ON b.queue_id=q.id WHERE q.source_chat_id<>?", (backup_chat,)
+        ).fetchone()[0]
+        return done, total
+
+
+def restore_items(backup_chat: int):
+    """Every post that exists in the backup channel, in order: [(message_id in backup channel, reply_markup_json)]."""
+    with connection() as db:
+        rows = db.execute(
+            """SELECT b.backup_message_id AS mid, q.reply_markup_json AS markup
+               FROM backups b JOIN queue q ON q.id=b.queue_id WHERE b.backup_chat=?
+               UNION ALL
+               SELECT q.message_id AS mid, q.reply_markup_json AS markup FROM queue q WHERE q.source_chat_id=?
+               ORDER BY mid""",
+            (backup_chat, backup_chat),
+        ).fetchall()
+        return [(int(r["mid"]), r["markup"]) for r in rows]
+
+
+def use_backup_copy(queue_id: int) -> bool:
+    """The original of a post is gone: point it at its copy in the backup channel. False if there is no copy."""
+    with connection() as db:
+        row = db.execute(
+            "SELECT backup_chat, backup_message_id FROM backups WHERE queue_id=?", (queue_id,)
+        ).fetchone()
+        if not row:
+            return False
+        db.execute("DELETE FROM backups WHERE queue_id=?", (queue_id,))
+        try:
+            db.execute(
+                "UPDATE queue SET source_chat_id=?, message_id=? WHERE id=?",
+                (row["backup_chat"], row["backup_message_id"], queue_id),
+            )
+        except sqlite3.IntegrityError:  # that copy is already in the library as its own post
+            db.execute("DELETE FROM queue WHERE id=?", (queue_id,))
+            db.execute("DELETE FROM channel_queue WHERE queue_id=?", (queue_id,))
+            db.execute("DELETE FROM channel_sent WHERE queue_id=?", (queue_id,))
+        return True
+
+
+# ---------------------------------------------------------- snapshot file
+
+SNAPSHOT_FORMAT = "scheduler-backup-v1"
+
+
+def export_snapshot() -> dict:
+    """Everything needed to rebuild the bot on a fresh deployment (no media, no tokens)."""
+    with connection() as db:
+        posts = []
+        for r in db.execute(
+            """SELECT q.*, b.backup_chat AS bchat, b.backup_message_id AS bmid
+               FROM queue q LEFT JOIN backups b ON b.queue_id=q.id ORDER BY q.id"""
+        ).fetchall():
+            posts.append({
+                "source_chat_id": r["source_chat_id"], "message_id": r["message_id"], "caption": r["caption"],
+                "entities_json": r["entities_json"], "reply_markup_json": r["reply_markup_json"],
+                "content_type": r["content_type"], "media_group_id": r["media_group_id"],
+                "imported": r["imported"], "backup_chat": r["bchat"], "backup_message_id": r["bmid"],
+            })
+        return {
+            "format": SNAPSHOT_FORMAT,
+            "created_at": _now(),
+            "backup_chat": _setting(db, "backup_chat"),
+            "sources": [dict(r) for r in db.execute("SELECT chat_id, title FROM sources")],
+            "destinations": [
+                dict(r) for r in db.execute(
+                    "SELECT chat_id,title,kind,thread_id,interval_minutes,batch_size,paused FROM channels"
+                )
+            ],
+            "admins": [int(r["user_id"]) for r in db.execute("SELECT user_id FROM admins")],
+            "settings": {
+                r["key"]: r["value"] for r in db.execute(
+                    "SELECT key, value FROM settings WHERE key LIKE 'footer:%' OR key LIKE 'watermark:%'"
+                )
+            },
+            "posts": posts,
+        }
+
+
+def import_snapshot(data: dict) -> dict:
+    """Merge a snapshot into this database (nothing existing is overwritten). Destinations are returned for the
+    caller to check and add, because only the bot can tell whether it may post there."""
+    if not isinstance(data, dict) or data.get("format") != SNAPSHOT_FORMAT:
+        raise ValueError("This is not a backup file made by this bot.")
+    summary = {"posts_added": 0, "posts_existing": 0, "sources": 0, "admins": 0, "settings": 0,
+               "destinations": data.get("destinations") or []}
+    with connection() as db:
+        for s in data.get("sources") or []:
+            cur = db.execute(
+                "INSERT OR IGNORE INTO sources(chat_id,title,added_at) VALUES(?,?,?)",
+                (int(s["chat_id"]), str(s.get("title") or s["chat_id"]), _now()),
+            )
+            summary["sources"] += cur.rowcount
+        for uid in data.get("admins") or []:
+            summary["admins"] += db.execute(
+                "INSERT OR IGNORE INTO admins(user_id,added_by,added_at) VALUES(?,?,?)", (int(uid), None, _now())
+            ).rowcount
+        for key, value in (data.get("settings") or {}).items():
+            if key.startswith(("footer:", "watermark:")):
+                summary["settings"] += db.execute(
+                    "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, str(value))
+                ).rowcount
+        if data.get("backup_chat") and _setting(db, "backup_chat") is None:
+            _put(db, "backup_chat", int(data["backup_chat"]))
+
+        for p in data.get("posts") or []:
+            src, mid = int(p["source_chat_id"]), int(p["message_id"])
+            cur = db.execute(
+                """INSERT OR IGNORE INTO queue(source_chat_id,message_id,caption,entities_json,reply_markup_json,
+                                               created_at,content_type,media_group_id,imported)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (src, mid, p.get("caption"), p.get("entities_json"), p.get("reply_markup_json"), _now(),
+                 p.get("content_type"), p.get("media_group_id"), int(p.get("imported") or 0)),
+            )
+            if cur.rowcount:
+                summary["posts_added"] += 1
+            else:
+                summary["posts_existing"] += 1
+            if p.get("backup_chat") and p.get("backup_message_id"):
+                row = db.execute("SELECT id FROM queue WHERE source_chat_id=? AND message_id=?", (src, mid)).fetchone()
+                if row:
+                    db.execute(
+                        "INSERT OR IGNORE INTO backups(queue_id,backup_chat,backup_message_id,backed_at) VALUES(?,?,?,?)",
+                        (row["id"], int(p["backup_chat"]), int(p["backup_message_id"]), _now()),
+                    )
+        for r in db.execute("SELECT chat_id FROM sources").fetchall():
+            _delete_destination(db, int(r["chat_id"]))
+        _refresh_caches(db)
+    return summary
+
+
+def state_fingerprint() -> str:
+    """Cheap summary of everything a snapshot holds; changes whenever that data changes."""
+    with connection() as db:
+        parts = [
+            tuple(db.execute("SELECT COUNT(*), COALESCE(MAX(id),0) FROM queue").fetchone()),
+            tuple(db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(chat_id),0), COALESCE(SUM(interval_minutes),0), COALESCE(SUM(paused),0), "
+                "COALESCE(SUM(COALESCE(batch_size,0)),0), COALESCE(SUM(COALESCE(thread_id,0)),0) FROM channels"
+            ).fetchone()),
+            tuple(db.execute("SELECT COUNT(*), COALESCE(SUM(chat_id),0) FROM sources").fetchone()),
+            tuple(db.execute("SELECT COUNT(*), COALESCE(SUM(user_id),0) FROM admins").fetchone()),
+            tuple(db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(value)),0) FROM settings "
+                "WHERE key LIKE 'footer:%' OR key LIKE 'watermark:%'"
+            ).fetchone()),
+            tuple(db.execute("SELECT COUNT(*), COALESCE(MAX(backup_message_id),0) FROM backups").fetchone()),
+            _setting(db, "backup_chat"),
+        ]
+        return repr(parts)

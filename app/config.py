@@ -38,3 +38,13 @@ QUIET_END_HOUR = _int("QUIET_END_HOUR", 7, minimum=0, maximum=23)
 LOW_POST_THRESHOLD = _int("LOW_POST_THRESHOLD", 10, minimum=0)      # 0 = no low-post alert
 DAILY_REPORT_HOUR = _int("DAILY_REPORT_HOUR", 8, minimum=-1, maximum=23)  # local hour; -1 = no daily report
 MAX_IMPORT_RANGE = _int("MAX_IMPORT_RANGE", 5000, minimum=1)
+
+# Backup channel copies and snapshot file
+BACKUP_DELAY_SECONDS = _int("BACKUP_DELAY_SECONDS", 3, minimum=1)   # pause between copies (Telegram limits ~20/min)
+AUTO_SNAPSHOT_HOURS = _int("AUTO_SNAPSHOT_HOURS", 24, minimum=0)    # send a snapshot file to the owners; 0 = off
+MAX_RESTORE_RANGE = _int("MAX_RESTORE_RANGE", 20000, minimum=1)
+
+# Auto-detect after a reset: chats the bot should find again by itself
+DESTINATION_IDS = {int(x) for x in re.findall(r"-?\d+", os.getenv("DESTINATION_CHAT_IDS", ""))}
+DESTINATION_IDS.discard(0)
+BACKUP_CHANNEL_ID = _int("BACKUP_CHANNEL_ID", 0)
