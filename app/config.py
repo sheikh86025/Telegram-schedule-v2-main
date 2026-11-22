@@ -23,7 +23,8 @@ SOURCE_IDS = {int(x) for x in re.findall(r"-?\d+", os.getenv("SOURCE_CHANNEL_IDS
 SOURCE_IDS.discard(0)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./data/bot.db")
 
-POLL_SECONDS = _int("POLL_SECONDS", 10, minimum=5)
+# How often the scheduler looks for a due destination. 30 s is plenty (fixed times are minute-exact) and light on CPU.
+POLL_SECONDS = _int("POLL_SECONDS", 30, minimum=5, maximum=300)
 BATCH_SIZE = _int("BATCH_SIZE", 12, minimum=1)
 DEFAULT_INTERVAL_MINUTES = _int("DEFAULT_INTERVAL_MINUTES", 200, minimum=1)
 POST_DELAY_SECONDS = _int("POST_DELAY_SECONDS", 3, minimum=0)
@@ -48,3 +49,6 @@ MAX_RESTORE_RANGE = _int("MAX_RESTORE_RANGE", 20000, minimum=1)
 DESTINATION_IDS = {int(x) for x in re.findall(r"-?\d+", os.getenv("DESTINATION_CHAT_IDS", ""))}
 DESTINATION_IDS.discard(0)
 BACKUP_CHANNEL_ID = _int("BACKUP_CHANNEL_ID", 0)
+
+# Failure alert: DM the admins after this many failed sends in a row for one destination (reminder at most every 6 h)
+FAIL_ALERT_AFTER = _int("FAIL_ALERT_AFTER", 3, minimum=1)

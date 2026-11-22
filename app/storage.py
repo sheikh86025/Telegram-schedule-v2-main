@@ -142,6 +142,8 @@ def init_db():
         ))
         # Posts added by an ID-range import carry no content at all (older databases did not mark them).
         db.execute("UPDATE queue SET imported=1 WHERE imported=0 AND content_type IS NULL AND entities_json IS NULL")
+        # The watermark feature was removed: forget any old watermark text.
+        db.execute("DELETE FROM settings WHERE key LIKE 'watermark:%'")
         # Sources from the environment variables are always present.
         for cid in SOURCE_IDS:
             db.execute("INSERT OR IGNORE INTO sources(chat_id,title,added_at) VALUES(?,?,?)", (cid, str(cid), _now()))
@@ -269,9 +271,8 @@ def _delete_destination(db, chat_id: int):
     db.execute("DELETE FROM channels WHERE chat_id=?", (chat_id,))
     db.execute("DELETE FROM channel_queue WHERE channel_id=?", (chat_id,))
     db.execute("DELETE FROM channel_sent WHERE channel_id=?", (chat_id,))
-    db.execute("DELETE FROM settings WHERE key IN (?,?,?,?,?,?)", tuple(
-        f"{k}:{chat_id}" for k in ("cycle", "usedalert", "usedalert_at", "lowalert", "footer", "watermark")
-    ))
+    keys = ("cycle", "usedalert", "usedalert_at", "lowalert", "footer", "button", "times", "fail", "failalert")
+    db.execute(f"DELETE FROM settings WHERE key IN ({','.join('?' * len(keys))})", tuple(f"{k}:{chat_id}" for k in keys))
 
 
 def remove_channel(chat_id: int):
@@ -488,7 +489,7 @@ def postpone_channel(channel_id: int, next_run: str):
         db.execute("UPDATE channels SET next_run=? WHERE chat_id=?", (next_run, channel_id))
 
 
-# ----------------------------------------------------- footer / watermark text
+# ----------------------------------------------------- footer / button / fixed-time settings
 
 def set_branding(kind: str, target, value: str):
     with connection() as db:
@@ -513,7 +514,7 @@ def get_branding(kind: str, chat_id: int):
 def list_branding():
     with connection() as db:
         return db.execute(
-            "SELECT key, value FROM settings WHERE key LIKE 'footer:%' OR key LIKE 'watermark:%' ORDER BY key"
+            "SELECT key, value FROM settings WHERE key LIKE 'footer:%' OR key LIKE 'button:%' OR key LIKE 'times:%' ORDER BY key"
         ).fetchall()
 
 
@@ -590,6 +591,12 @@ def get_setting(key: str, default=None):
 def set_setting(key: str, value):
     with connection() as db:
         _put(db, key, value)
+
+
+def delete_settings(*keys: str):
+    with connection() as db:
+        for key in keys:
+            db.execute("DELETE FROM settings WHERE key=?", (key,))
 
 
 # ------------------------------------------------------------ backup channel
@@ -710,7 +717,7 @@ def export_snapshot() -> dict:
             "admins": [int(r["user_id"]) for r in db.execute("SELECT user_id FROM admins")],
             "settings": {
                 r["key"]: r["value"] for r in db.execute(
-                    "SELECT key, value FROM settings WHERE key LIKE 'footer:%' OR key LIKE 'watermark:%'"
+                    "SELECT key, value FROM settings WHERE key LIKE 'footer:%' OR key LIKE 'button:%' OR key LIKE 'times:%'"
                 )
             },
             "posts": posts,
@@ -736,7 +743,7 @@ def import_snapshot(data: dict) -> dict:
                 "INSERT OR IGNORE INTO admins(user_id,added_by,added_at) VALUES(?,?,?)", (int(uid), None, _now())
             ).rowcount
         for key, value in (data.get("settings") or {}).items():
-            if key.startswith(("footer:", "watermark:")):
+            if key.startswith(("footer:", "button:", "times:")):
                 summary["settings"] += db.execute(
                     "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, str(value))
                 ).rowcount
@@ -782,7 +789,7 @@ def state_fingerprint() -> str:
             tuple(db.execute("SELECT COUNT(*), COALESCE(SUM(user_id),0) FROM admins").fetchone()),
             tuple(db.execute(
                 "SELECT COUNT(*), COALESCE(SUM(LENGTH(value)),0) FROM settings "
-                "WHERE key LIKE 'footer:%' OR key LIKE 'watermark:%'"
+                "WHERE key LIKE 'footer:%' OR key LIKE 'button:%' OR key LIKE 'times:%'"
             ).fetchone()),
             tuple(db.execute("SELECT COUNT(*), COALESCE(MAX(backup_message_id),0) FROM backups").fetchone()),
             _setting(db, "backup_chat"),

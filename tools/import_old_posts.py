@@ -5,7 +5,7 @@ Run once, with YOUR OWN Telegram account. It
   2. forwards the source channel's old posts to the bot in small batches,
   3. sends /done and prints the bot's summary.
 
-The bot saves them exactly like posts you forward by hand, so footer and watermark work too.
+The bot saves them exactly like posts you forward by hand, so the footer works too.
 New posts that arrive later are collected by the bot by itself - this script is only for the backlog.
 
 Before you start

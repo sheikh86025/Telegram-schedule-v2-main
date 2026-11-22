@@ -28,9 +28,9 @@ from .config import (
     BOT_TOKEN, ADMIN_IDS, POLL_SECONDS, BATCH_SIZE, DEFAULT_INTERVAL_MINUTES, POST_DELAY_SECONDS,
     TIMEZONE, QUIET_START_HOUR, QUIET_END_HOUR, LOW_POST_THRESHOLD, DAILY_REPORT_HOUR, MAX_IMPORT_RANGE,
     BACKUP_DELAY_SECONDS, AUTO_SNAPSHOT_HOURS, MAX_RESTORE_RANGE, DESTINATION_IDS, BACKUP_CHANNEL_ID,
+    FAIL_ALERT_AFTER,
 )
 from . import storage
-from .media import watermark_image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -283,9 +283,11 @@ ADMIN_MENU = [
     ("stopjob", "Stop the running backup/restore"),
     ("setfooter", "Set footer text under posts"),
     ("clearfooter", "Remove footer"),
-    ("setwatermark", "Set watermark text for photos"),
-    ("clearwatermark", "Remove watermark"),
-    ("branding", "Show footer and watermark settings"),
+    ("setbutton", "Button under the last post of each batch"),
+    ("clearbutton", "Remove that button"),
+    ("settimes", "Fixed posting times (09:00,14:00) instead of interval"),
+    ("cleartimes", "Back to interval posting"),
+    ("branding", "Show footer, button and fixed-time settings"),
     ("addadmin", "Give someone admin access (owner only)"),
     ("removeadmin", "Remove an admin (owner only)"),
     ("admins", "List owners and admins"),
@@ -298,6 +300,7 @@ GROUP_MENU = [
     ("sendnow", "Send a batch here now"),
     ("setinterval", "Set minutes between batches here"),
     ("setbatch", "Set posts per batch here"),
+    ("settimes", "Set fixed posting times here"),
 ]
 PUBLIC_MENU = [("start", "Start the bot")]
 
@@ -362,10 +365,11 @@ def help_text() -> str:
         "/stats — posts, used, remaining, sent in 24h\n"
         f"Low-post alert at {LOW_POST_THRESHOLD} left; alert when all posts are used; "
         + (f"daily report at {DAILY_REPORT_HOUR:02d}:00." if DAILY_REPORT_HOUR >= 0 else "daily report off.") + "\n\n"
-        "<b>Footer &amp; watermark</b>\n"
+        "<b>Footer, button &amp; fixed times</b>\n"
         "/setfooter all | text — added under every post\n"
-        "/setwatermark all | text — drawn on photos\n"
-        "/clearfooter · /clearwatermark · /branding\n"
+        "/setbutton all | Join Channel | https://t.me/yourchannel — button under the <b>last post of each batch</b>\n"
+        "/settimes all | 09:00,14:00,21:00 — post at these times instead of every N minutes\n"
+        "/clearfooter · /clearbutton · /cleartimes · /branding\n"
         "Use a chat ID instead of <code>all</code> for one destination, or <code>-</code> as text to switch it off there.\n\n"
         "<b>Send now</b>\n"
         "/sendnow all|CHAT_ID [count] — sends immediately, <b>even in quiet hours</b>\n"
@@ -373,7 +377,7 @@ def help_text() -> str:
         "<b>Admins</b> (owner only)\n"
         "/addadmin USER_ID · /removeadmin USER_ID · /admins\n\n"
         "<b>How it works</b>\n"
-        f"Each destination sends up to {BATCH_SIZE} posts, then waits its interval. New posts go to one "
+        f"Each destination sends up to {BATCH_SIZE} posts, then waits its interval (or the next fixed time). New posts go to one "
         "destination (round-robin); when its queue is empty it sends random posts from the library without "
         f"repeats until all were used. Quiet hours: {quiet_label()}."
     )
@@ -784,10 +788,12 @@ async def channels_cmd(message: Message):
             extras.append("⏸ paused")
         if c["thread_id"]:
             extras.append(f"topic {c['thread_id']}")
+        times = await db(storage.get_branding, "times", int(c["chat_id"]))
+        when = f"at {times.replace(',', ', ')}" if times else f"every {c['interval_minutes']} min"
         lines.append(
             f"{icon(c['kind'])} <b>{escape(c['title'])}</b> <code>{c['chat_id']}</code>"
             + (f" ({', '.join(extras)})" if extras else "")
-            + f"\n   every {c['interval_minutes']} min · batch {c['batch_size'] or BATCH_SIZE} · "
+            + f"\n   {when} · batch {c['batch_size'] or BATCH_SIZE} · "
               f"pending {c['pending']} · next {fmt_local(c['next_run'])}"
         )
     await message.answer(
@@ -897,7 +903,7 @@ async def import_history_cmd(message: Message):
         f"{added} added, {existed} already there. Library: {library} post(s).\n\n"
         "IDs that do not exist (deleted posts, service messages) are cleaned out automatically the first "
         "time the bot tries to send them. Footer works on these posts only when the post is a photo/video "
-        "that the bot saw live or you forwarded; watermark needs a post saved live or forwarded."
+        "that the bot saw live or you forwarded."
         "\n\nChanged your mind? /delete_history removes imported posts again."
     )
 
@@ -1353,7 +1359,7 @@ async def import_backup_cmd(message: Message):
     lines = [
         "<b>Backup restored</b>",
         f"Posts: {summary['posts_added']} added, {summary['posts_existing']} already there",
-        f"Sources: {summary['sources']} · extra admins: {summary['admins']} · footer/watermark settings: {summary['settings']}",
+        f"Sources: {summary['sources']} · extra admins: {summary['admins']} · footer/button/time settings: {summary['settings']}",
         f"Destinations re-added: {len(restored)}",
     ]
     if rejoin:
@@ -1443,7 +1449,7 @@ async def restore_posts_cmd(message: Message):
     await message.answer(
         f"Post <b>{len(items)}</b> backed-up post(s) into {where}"
         + (f" ({len(targets)} destinations)" if token == "all" else "")
-        + f"? That takes {eta_text(len(items) * len(targets))}. They are plain copies (no footer/watermark), oldest first.",
+        + f"? That takes {eta_text(len(items) * len(targets))}. They are plain copies (no footer/button), oldest first.",
         reply_markup=keyboard,
     )
 
@@ -1747,10 +1753,10 @@ async def unknown_chat_buttons(query: CallbackQuery):
     await query.answer()
 
 
-# ------------------------------------------------------- footer and watermark
+# ------------------------------------------------------- footer, button, fixed times
 
 MAX_FOOTER = 300
-MAX_WATERMARK = 40
+MAX_BUTTONS = 3
 
 
 def _branding_setter(kind: str, command: str, limit: int, label: str):
@@ -1780,7 +1786,7 @@ def _branding_setter(kind: str, command: str, limit: int, label: str):
     return handler
 
 
-def _branding_clearer(kind: str, command: str, label: str):
+def _branding_clearer(kind: str, command: str, label: str, extra: str = ""):
     @dp.message(Command(command))
     async def handler(message: Message):
         if not is_admin(message):
@@ -1790,14 +1796,181 @@ def _branding_clearer(kind: str, command: str, label: str):
         except ValueError:
             return await message.answer(f"Format: /{command} all   or   /{command} CHAT_ID")
         await db(storage.clear_branding, kind, target)
-        await message.answer(f"{label} cleared for {'every destination' if target == 'all' else target}.")
+        await message.answer(f"{label} cleared for {'every destination' if target == 'all' else target}.{extra}")
     return handler
 
 
 _branding_setter("footer", "setfooter", MAX_FOOTER, "Footer")
-_branding_setter("watermark", "setwatermark", MAX_WATERMARK, "Watermark")
 _branding_clearer("footer", "clearfooter", "Footer")
-_branding_clearer("watermark", "clearwatermark", "Watermark")
+_branding_clearer("button", "clearbutton", "Button")
+_branding_clearer("times", "cleartimes", "Fixed times", " Destinations without their own setting go back to the interval.")
+
+
+# ---- button under the last post of each batch
+
+def parse_buttons(parts: list) -> list:
+    """['Join', 'https://t.me/x', 'More', 't.me/y'] -> [['Join', url], ['More', url]]; ValueError when invalid."""
+    if not parts or len(parts) % 2 or len(parts) > MAX_BUTTONS * 2:
+        raise ValueError
+    pairs = []
+    for i in range(0, len(parts), 2):
+        text, url = parts[i].strip(), parts[i + 1].strip()
+        if not text or len(text) > 60:
+            raise ValueError
+        if url.startswith("@"):
+            url = "https://t.me/" + url[1:]
+        elif url.lower().startswith(("t.me/", "telegram.me/")):
+            url = "https://" + url
+        if not re.match(r"^(https?://|tg://)\S+$", url):
+            raise ValueError
+        pairs.append([text, url])
+    return pairs
+
+
+@dp.message(Command("setbutton"))
+async def set_button_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    parts = [p.strip() for p in command_args(message).split("|")]
+    target, rest = None, parts
+    try:
+        target, rest = parse_target(parts[0]), parts[1:]
+    except ValueError:
+        if message.chat.type in GROUP_TYPES:
+            target = message.chat.id
+    usage = (
+        "Format: <code>/setbutton all | Join Channel | https://t.me/yourchannel</code>\n"
+        "One destination: <code>/setbutton CHAT_ID | Text | link</code> (in a group: <code>/setbutton Text | link</code>)\n"
+        "Up to 3 buttons: <code>/setbutton all | Text 1 | link 1 | Text 2 | link 2</code>\n"
+        "Switch off for one destination: <code>/setbutton CHAT_ID | -</code>\n\n"
+        "The button is added under the <b>last post of every batch</b>."
+    )
+    if target is None:
+        return await message.answer(usage)
+    if rest == ["-"]:
+        value = "-"
+    else:
+        try:
+            value = json.dumps(parse_buttons(rest), ensure_ascii=False)
+        except ValueError:
+            return await message.answer("Could not read the button text/link.\n\n" + usage)
+    await db(storage.set_branding, "button", target, value)
+    where = "every destination" if target == "all" else f"<code>{target}</code>"
+    await message.answer(
+        f"Button for {where} switched off." if value == "-"
+        else f"Button for {where} saved. It appears under the last post of each batch (from the next batch)."
+    )
+
+
+def button_pairs(raw):
+    if not raw:
+        return []
+    try:
+        return [(str(t), str(u)) for t, u in json.loads(raw)]
+    except (ValueError, TypeError):
+        return []
+
+
+async def add_button_to_last(chat_id: int, message_id: int, post, pairs: list):
+    """Put the 'Join Channel' style button under the last message of a batch (keeps the post's own buttons)."""
+    rows = []
+    existing = post_markup(post)
+    if existing:
+        rows = [list(r) for r in existing.inline_keyboard]
+    rows += [[InlineKeyboardButton(text=t, url=u)] for t, u in pairs]
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    for _ in range(2):
+        try:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=markup)
+            return
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(int(exc.retry_after) + 1)
+        except TelegramAPIError as exc:
+            logging.warning("Could not add the button in %s: %s", chat_id, exc)
+            return
+
+
+# ---- fixed posting times
+
+TIME_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?$")
+
+
+def parse_times(raw: str) -> list:
+    """'9:00, 14:00 21' -> ['09:00', '14:00', '21:00'] (sorted, no duplicates); ValueError when invalid."""
+    items = [p for p in re.split(r"[,\s;]+", raw.strip()) if p]
+    if not items or len(items) > 24:
+        raise ValueError
+    found = set()
+    for item in items:
+        m = TIME_RE.match(item)
+        if not m:
+            raise ValueError
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        if hour > 23 or minute > 59:
+            raise ValueError
+        found.add(f"{hour:02d}:{minute:02d}")
+    return sorted(found)
+
+
+def next_fixed_run(times: str) -> str:
+    """UTC ISO time of the next fixed slot (local time zone) after now."""
+    now_local = datetime.now(TZ)
+    for day in (0, 1):
+        for slot in times.split(","):
+            hour, minute = (int(x) for x in slot.split(":"))
+            candidate = (now_local + timedelta(days=day)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate > now_local:
+                return candidate.astimezone(timezone.utc).isoformat()
+    return utc_in(hours=24)
+
+
+async def reschedule_fixed(target):
+    """After /settimes: every affected destination waits for its next fixed slot."""
+    for c in await db(storage.list_channels):
+        chat_id = int(c["chat_id"])
+        if target != "all" and chat_id != target:
+            continue
+        times = await db(storage.get_branding, "times", chat_id)
+        if times:
+            await db(storage.postpone_channel, chat_id, next_fixed_run(times))
+
+
+@dp.message(Command("settimes"))
+async def set_times_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    head, sep, body = command_args(message).partition("|")
+    body = body.strip()
+    try:
+        target = parse_target(head) if head.strip() else None
+    except ValueError:
+        target = None
+    if target is None and message.chat.type in GROUP_TYPES and not sep:
+        target, body = message.chat.id, head.strip()
+    usage = (
+        "Format: <code>/settimes all | 09:00,14:00,21:00</code>\n"
+        "One destination: <code>/settimes CHAT_ID | 09:00,21:00</code> (in a group: <code>/settimes 09:00,21:00</code>)\n"
+        "Back to the interval for one destination: <code>/settimes CHAT_ID | -</code>\n"
+        f"Times are in {TIMEZONE}. At every time one batch is sent (see /setbatch)."
+    )
+    if target is None or not body:
+        return await message.answer(usage)
+    if body == "-":
+        value = "-"
+    else:
+        try:
+            value = ",".join(parse_times(body))
+        except ValueError:
+            return await message.answer("Could not read those times. Use 24-hour HH:MM.\n\n" + usage)
+    await db(storage.set_branding, "times", target, value)
+    where = "every destination" if target == "all" else f"<code>{target}</code>"
+    if value == "-":
+        return await message.answer(f"Fixed times switched off for {where}: it uses the interval.")
+    await reschedule_fixed(target)
+    await message.answer(
+        f"Fixed times for {where}: <b>{value.replace(',', ', ')}</b> ({TIMEZONE}).\n"
+        f"Next batch: {fmt_local(next_fixed_run(value))}. During quiet hours ({quiet_label()}) a batch waits until they end."
+    )
 
 
 @dp.message(Command("branding"))
@@ -1806,16 +1979,22 @@ async def branding_cmd(message: Message):
         return await deny(message)
     rows = await db(storage.list_branding)
     if not rows:
-        return await message.answer("No footer or watermark set. Use /setfooter and /setwatermark.")
+        return await message.answer("Nothing set. Use /setfooter, /setbutton and /settimes.")
     lines = []
     for r in rows:
         kind, _, target = r["key"].partition(":")
         where = "all destinations" if target == "all" else target
-        lines.append(f"<b>{kind}</b> ({where}): {escape(r['value'])}")
+        if kind == "button":
+            shown = "off" if r["value"] == "-" else " · ".join(f"{escape(t)} → {escape(u)}" for t, u in button_pairs(r["value"]))
+        elif kind == "times":
+            shown = "off (interval)" if r["value"] == "-" else r["value"].replace(",", ", ")
+        else:
+            shown = escape(r["value"])
+        lines.append(f"<b>{kind}</b> ({where}): {shown}")
     await message.answer(
         "\n".join(lines)
-        + "\n\nFooter works on text posts and on photo/video/file captions. Watermark is drawn on photos "
-          "the bot saved live or that you forwarded. A destination's own setting beats the 'all' one."
+        + "\n\nFooter works on text posts and on photo/video/file captions. The button goes under the last post "
+          "of each batch. A destination's own setting beats the 'all' one."
     )
 
 
@@ -1948,9 +2127,9 @@ def load_entities(post, kind: str):
     return result or None
 
 
-async def deliver(chat_id: int, thread_id, post, footer, watermark):
-    """Send one saved post. Plain copy by default; with a footer/watermark the post is rebuilt:
-    text posts are re-sent with the footer, media gets a new caption, photos can be watermarked."""
+async def deliver(chat_id: int, thread_id, post, footer) -> int:
+    """Send one saved post and return the new message id. Plain copy by default; with a footer the post is
+    rebuilt: text posts are re-sent with the footer, media gets a new caption."""
     markup = None
     if post["reply_markup_json"]:
         try:
@@ -1966,11 +2145,11 @@ async def deliver(chat_id: int, thread_id, post, footer, watermark):
 
     # Text post + footer: a text message cannot be edited while copying, so send it again with the footer.
     if ctype == "text" and footer and text and len(text) + 2 + len(footer) <= 4096:
-        await bot.send_message(
+        sent = await bot.send_message(
             **base, text=f"{text}\n\n{footer}", entities=load_entities(post, "text"), parse_mode=None,
             reply_markup=markup,
         )
-        return
+        return sent.message_id
 
     new_caption = None
     if ctype in CAPTION_TYPES:
@@ -1980,28 +2159,44 @@ async def deliver(chat_id: int, thread_id, post, footer, watermark):
             if len(candidate) <= 1024:
                 new_caption = candidate
 
-        if watermark and ctype == "photo" and post["file_id"]:
-            marked = None
-            try:
-                raw = (await bot.download(post["file_id"])).read()
-                marked = await asyncio.to_thread(watermark_image, raw, watermark)
-            except Exception:
-                logging.exception("Watermark failed; sending without it")
-            if marked:
-                caption = new_caption if new_caption is not None else (text or None)
-                await bot.send_photo(
-                    **base, photo=BufferedInputFile(marked, "post.jpg"), caption=caption,
-                    caption_entities=load_entities(post, "caption") if caption else None,
-                    parse_mode=None, reply_markup=markup,
-                )
-                return
-
     kwargs = {**base, "from_chat_id": post["source_chat_id"], "message_id": post["message_id"]}
     if markup:
         kwargs["reply_markup"] = markup
     if new_caption is not None:
         kwargs.update(caption=new_caption, caption_entities=load_entities(post, "caption"), parse_mode=None)
-    await bot.copy_message(**kwargs)
+    sent = await bot.copy_message(**kwargs)
+    return sent.message_id
+
+
+# ---- failure alert: DM the admins when a destination keeps failing
+
+FAIL_REMIND_HOURS = 6
+
+
+async def record_failure(chat_id: int, title: str, reason: str):
+    count = int(await db(storage.get_setting, f"fail:{chat_id}", 0) or 0) + 1
+    await db(storage.set_setting, f"fail:{chat_id}", count)
+    if count < FAIL_ALERT_AFTER:
+        return
+    last = await db(storage.get_setting, f"failalert:{chat_id}")
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=FAIL_REMIND_HOURS)).isoformat()
+    if last and str(last) > cutoff:
+        return
+    await db(storage.set_setting, f"failalert:{chat_id}", datetime.now(timezone.utc).isoformat())
+    await notify_admins(
+        "⚠️ <b>Posting keeps failing</b>\n\n"
+        f"<b>Chat:</b> {escape(title)}\n"
+        f"<b>ID:</b> <code>{chat_id}</code>\n"
+        f"<b>Failed in a row:</b> {count}\n"
+        f"<b>Last error:</b> {escape(reason[:300])}\n\n"
+        "Check that the bot is still admin there with 'Post messages'. It keeps trying; "
+        f"you get a reminder at most every {FAIL_REMIND_HOURS} hours."
+    )
+
+
+async def record_success(chat_id: int):
+    if await db(storage.get_setting, f"fail:{chat_id}") is not None:
+        await db(storage.delete_settings, f"fail:{chat_id}", f"failalert:{chat_id}")
 
 
 async def run_alerts(chat_id: int, title: str):
@@ -2037,7 +2232,10 @@ async def process_channel(channel):
         await db(storage.clear_force, chat_id)  # /sendnow handled: do it once
     thread_id = channel["thread_id"]
     footer = await db(storage.get_branding, "footer", chat_id)
-    watermark = await db(storage.get_branding, "watermark", chat_id)
+    times = await db(storage.get_branding, "times", chat_id)
+    buttons = button_pairs(await db(storage.get_branding, "button", chat_id))
+    last_sent = None  # (message id, post) of the newest message of this batch
+    ran_dry = False
     sent = attempts = 0
     max_attempts = batch * 3 + 50  # posts that no longer exist are skipped without counting as sent
 
@@ -2045,10 +2243,11 @@ async def process_channel(channel):
         attempts += 1
         post = await db(storage.get_next_post, chat_id)
         if not post:
+            ran_dry = True
             break
 
         try:
-            await deliver(chat_id, thread_id, post, footer, watermark)
+            new_id = await deliver(chat_id, thread_id, post, footer)
         except TelegramRetryAfter as exc:
             wait = int(exc.retry_after) + 1
             logging.warning("Rate limited on %s; retrying in %ss", chat_id, wait)
@@ -2077,6 +2276,7 @@ async def process_channel(channel):
                     await drop_channel(chat_id, channel["title"], "bot lost access or permission to post")
                     return
                 if verdict is None:
+                    await record_failure(chat_id, channel["title"], "Telegram could not be reached to check permissions")
                     await db(storage.postpone_channel, chat_id, utc_in(minutes=1))
                     return
                 if await db(storage.use_backup_copy, post["id"]):
@@ -2084,20 +2284,30 @@ async def process_channel(channel):
                 await source_unreachable(post, chat_id)
                 return
             logging.exception("Post %s rejected for %s; skipping it", post["id"], chat_id)
+            await record_failure(chat_id, channel["title"], f"Telegram rejected a post: {exc}")
             await db(storage.finish_channel_post, chat_id, post["id"], False)
             continue
-        except TelegramAPIError:
+        except TelegramAPIError as exc:
             logging.exception("Send failed for %s; retrying in 1 minute", chat_id)
+            await record_failure(chat_id, channel["title"], f"Send failed: {exc}")
             await db(storage.postpone_channel, chat_id, utc_in(minutes=1))
             return
 
         await db(storage.finish_channel_post, chat_id, post["id"])
+        last_sent = (new_id, post)
         sent += 1
         logging.info("Sent post %s/%s to %s", sent, batch, chat_id)
         if sent < batch and POST_DELAY_SECONDS:
             await asyncio.sleep(POST_DELAY_SECONDS)
 
     if sent:
+        await record_success(chat_id)
+        if buttons and last_sent:
+            await add_button_to_last(chat_id, last_sent[0], last_sent[1], buttons)
+    if times and (sent or ran_dry):
+        await db(storage.postpone_channel, chat_id, next_fixed_run(times))
+        logging.info("Batch done for %s: %s post(s); next fixed time (%s)", chat_id, sent, times)
+    elif sent:
         await db(storage.postpone_channel, chat_id, utc_in(minutes=interval))
         logging.info("Batch done for %s: %s post(s); next in %s min", chat_id, sent, interval)
     else:
@@ -2119,11 +2329,13 @@ async def maybe_daily_report(now_local: datetime):
 
 async def scheduler():
     while True:
+        busy = False
         try:
             now_local = datetime.now(TZ)
             quiet = in_quiet_hours(now_local)
             channel = await db(storage.next_due_channel, datetime.now(timezone.utc).isoformat(), quiet)
             if channel:
+                busy = True
                 await process_channel(channel)
             await maybe_daily_report(now_local)
             await maybe_auto_snapshot()
@@ -2133,7 +2345,8 @@ async def scheduler():
         except Exception:
             logging.exception("Scheduler error; continuing in 30 seconds")
             await asyncio.sleep(30)
-        await asyncio.sleep(POLL_SECONDS)
+        # Another destination may be due right now (several fixed times coincide): do not wait a full poll.
+        await asyncio.sleep(1 if busy else POLL_SECONDS)
 
 
 @dp.message(F.chat.type.in_(GROUP_TYPES))
