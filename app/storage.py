@@ -354,45 +354,6 @@ def add_posts_range(source_chat_id: int, first_id: int, last_id: int):
     return added, len(rows) - added
 
 
-def _history_where(source_chat_id=None, first_id=None, last_id=None):
-    """WHERE clause + params selecting imported posts (optionally of one source), or a message-ID range
-    of one source (any post, imported or live)."""
-    if first_id is not None:
-        return "source_chat_id=? AND message_id BETWEEN ? AND ?", (source_chat_id, first_id, last_id)
-    if source_chat_id is not None:
-        return "imported=1 AND source_chat_id=?", (source_chat_id,)
-    return "imported=1", ()
-
-
-def count_history(source_chat_id=None, first_id=None, last_id=None) -> int:
-    where, params = _history_where(source_chat_id, first_id, last_id)
-    with connection() as db:
-        return db.execute(f"SELECT COUNT(*) FROM queue WHERE {where}", params).fetchone()[0]
-
-
-def imported_by_source():
-    """One row per source that has imported posts: chat_id, title (None for forwarded posts that belong to no
-    source) and the number of imported posts."""
-    with connection() as db:
-        return db.execute(
-            """SELECT q.source_chat_id AS chat_id, s.title AS title, COUNT(*) AS posts
-               FROM queue q LEFT JOIN sources s ON s.chat_id=q.source_chat_id
-               WHERE q.imported=1 GROUP BY q.source_chat_id ORDER BY s.title"""
-        ).fetchall()
-
-
-def delete_history(source_chat_id=None, first_id=None, last_id=None) -> int:
-    """Remove posts from the bot's library (and from every destination's queue/history).
-    Nothing is deleted from Telegram channels. Returns how many posts were removed."""
-    where, params = _history_where(source_chat_id, first_id, last_id)
-    with connection() as db:
-        ids = f"SELECT id FROM queue WHERE {where}"
-        db.execute(f"DELETE FROM channel_queue WHERE queue_id IN ({ids})", params)
-        db.execute(f"DELETE FROM channel_sent WHERE queue_id IN ({ids})", params)
-        db.execute(f"DELETE FROM backups WHERE queue_id IN ({ids})", params)
-        return db.execute(f"DELETE FROM queue WHERE {where}", params).rowcount
-
-
 def delete_post(queue_id: int):
     """Remove a post everywhere (used when the source message no longer exists)."""
     with connection() as db:

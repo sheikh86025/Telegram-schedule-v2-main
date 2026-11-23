@@ -38,7 +38,6 @@ QUIET_END_HOUR = _int("QUIET_END_HOUR", 7, minimum=0, maximum=23)
 # Alerts and reports
 LOW_POST_THRESHOLD = _int("LOW_POST_THRESHOLD", 10, minimum=0)      # 0 = no low-post alert
 DAILY_REPORT_HOUR = _int("DAILY_REPORT_HOUR", 8, minimum=-1, maximum=23)  # local hour; -1 = no daily report
-MAX_IMPORT_RANGE = _int("MAX_IMPORT_RANGE", 5000, minimum=1)
 
 # Backup channel copies and snapshot file
 BACKUP_DELAY_SECONDS = _int("BACKUP_DELAY_SECONDS", 3, minimum=1)   # pause between copies (Telegram limits ~20/min)

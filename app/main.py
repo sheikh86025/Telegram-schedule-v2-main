@@ -26,7 +26,7 @@ from aiogram.enums import ParseMode
 
 from .config import (
     BOT_TOKEN, ADMIN_IDS, POLL_SECONDS, BATCH_SIZE, DEFAULT_INTERVAL_MINUTES, POST_DELAY_SECONDS,
-    TIMEZONE, QUIET_START_HOUR, QUIET_END_HOUR, LOW_POST_THRESHOLD, DAILY_REPORT_HOUR, MAX_IMPORT_RANGE,
+    TIMEZONE, QUIET_START_HOUR, QUIET_END_HOUR, LOW_POST_THRESHOLD, DAILY_REPORT_HOUR,
     BACKUP_DELAY_SECONDS, AUTO_SNAPSHOT_HOURS, MAX_RESTORE_RANGE, DESTINATION_IDS, BACKUP_CHANNEL_ID,
     FAIL_ALERT_AFTER,
 )
@@ -44,7 +44,6 @@ dp = Dispatcher()
 DEST_TYPES = {"channel", "group", "supergroup"}
 GROUP_TYPES = {"group", "supergroup"}
 CAPTION_TYPES = {"photo", "video", "animation", "audio", "document", "voice"}
-IMPORTING: dict = {}  # admin user id -> running forward-import session
 
 
 # ------------------------------------------------------------------ helpers
@@ -269,9 +268,6 @@ ADMIN_MENU = [
     ("sources", "List source channels"),
     ("addsource", "Add a source channel"),
     ("removesource", "Remove a source channel"),
-    ("import_history", "Import old posts (forward or ID range)"),
-    ("done", "Finish forward-import"),
-    ("delete_history", "Delete imported old posts (one/range/all)"),
     ("detect", "Find channels/groups where the bot is already admin"),
     ("railway_vars", "IDs to paste into Railway variables"),
     ("setbackup", "Set the backup channel"),
@@ -348,9 +344,7 @@ def help_text() -> str:
         "/setinterval · /setbatch · /pause · /resume  (CHAT_ID or all)\n\n"
         "<b>Sources &amp; old posts</b>\n"
         "/sources · /addsource -100… · /removesource -100…\n"
-        "/import_history — forward old posts to the bot, then /done\n"
-        "/import_history SOURCE_ID FIRST_ID LAST_ID — add a range of old post IDs\n"
-        "/delete_history — remove imported posts: one ID, a range, per source, or all\n\n"
+        "\n"
         "<b>After a reset / redeploy</b>\n"
         "Set BACKUP_CHANNEL_ID (and optionally DESTINATION_CHAT_IDS) in Railway: the bot then finds its channels "
         "and settings by itself, no need to re-add it as admin. /detect runs the search now; /railway_vars shows "
@@ -744,7 +738,7 @@ def build_stats_text(title: str = "Statistics") -> str:
     data = storage.stats()
     lines = [f"<b>📊 {title}</b>", f"Library: <b>{data['total']}</b> post(s)"]
     for s in data["sources"]:
-        lines.append(f"  • source {escape(s['title'])}: {s['posts']}")
+        lines.append(f"  • source {escape(s['title'])} <code>{s['chat_id']}</code>: {s['posts']}")
     if data["manual"]:
         lines.append(f"  • added manually / forwarded: {data['manual']}")
     backup_chat = storage.get_backup_chat()
@@ -838,8 +832,6 @@ async def add_source_cmd(message: Message):
     await db(storage.add_source, chat.id, title)
     await message.answer(
         f"Source added: <b>{escape(title)}</b> (<code>{chat.id}</code>). New posts are collected automatically.\n"
-        f"To bring in old posts use <code>/import_history {chat.id} FIRST_ID LAST_ID</code> "
-        "or forward them with /import_history.\n"
         "It is no longer a destination, if it was one."
     )
 
@@ -859,188 +851,6 @@ async def remove_source_cmd(message: Message):
         )
     else:
         await message.answer("That ID is not a source. Check /sources.")
-
-
-@dp.message(Command("import_history"))
-async def import_history_cmd(message: Message):
-    """Bring old posts into the library. Telegram bots cannot read a channel's history by themselves, so:
-    (1) forward old posts to the bot, or (2) give a range of post IDs of a source channel."""
-    if not is_admin(message):
-        return await deny(message)
-    if message.chat.type != "private":
-        return await message.answer("Please use /import_history in a private chat with the bot.")
-    args = command_args(message).split()
-    uid = message.from_user.id
-
-    if not args:
-        IMPORTING[uid] = {"added": 0, "dup": 0}
-        return await message.answer(
-            "<b>Import mode ON</b>\n\n"
-            "Forward your old posts to me now. Tip: in the channel long-press a post, tap more posts to select "
-            "many, then Forward → this bot.\n"
-            "• Posts from a source channel are matched by their original ID, so duplicates are skipped.\n"
-            "• Do not delete the forwarded messages from this chat unless they came from a source channel.\n"
-            "• Imported posts join the library and are sent in the random rotation.\n\n"
-            "Send /done when finished.\n\n"
-            "<b>Whole range instead?</b> <code>/import_history SOURCE_ID FIRST_ID LAST_ID</code>\n"
-            "Post IDs: open a post, copy its link, the number at the end is the ID."
-        )
-
-    if len(args) != 3 or not args[1].isdigit() or not args[2].isdigit():
-        return await message.answer("Format: <code>/import_history SOURCE_ID FIRST_ID LAST_ID</code>  (or just /import_history)")
-    chat = await resolve_chat(args[0])
-    if chat is None or not storage.is_source(chat.id):
-        return await message.answer("That channel is not a source yet. Add it first with /addsource.")
-    first, last = int(args[1]), int(args[2])
-    if first < 1 or last < first:
-        return await message.answer("FIRST_ID must be at least 1 and not bigger than LAST_ID.")
-    if last - first + 1 > MAX_IMPORT_RANGE:
-        return await message.answer(f"Too many at once. Maximum {MAX_IMPORT_RANGE} IDs per command; split the range.")
-    added, existed = await db(storage.add_posts_range, chat.id, first, last)
-    library = await db(storage.library_size)
-    await message.answer(
-        f"Imported IDs {first}-{last} of <b>{escape(chat.title or str(chat.id))}</b>: "
-        f"{added} added, {existed} already there. Library: {library} post(s).\n\n"
-        "IDs that do not exist (deleted posts, service messages) are cleaned out automatically the first "
-        "time the bot tries to send them. Footer works on these posts only when the post is a photo/video "
-        "that the bot saw live or you forwarded."
-        "\n\nChanged your mind? /delete_history removes imported posts again."
-    )
-
-
-@dp.message(Command("done"))
-async def done_cmd(message: Message):
-    if not is_admin(message):
-        return await deny(message)
-    session = IMPORTING.pop(message.from_user.id, None)
-    if session is None:
-        return await message.answer("No import is running. Start one with /import_history.")
-    library = await db(storage.library_size)
-    await message.answer(
-        f"<b>Import finished</b>\nAdded: {session['added']}\nAlready saved (skipped): {session['dup']}\n"
-        f"Library now: {library} post(s)."
-    )
-
-
-@dp.message(Command("delete_history"))
-async def delete_history_cmd(message: Message):
-    """Remove imported old posts from the bot's library: one ID, an ID range, one source, or all imported."""
-    if not is_admin(message):
-        return await deny(message)
-    if message.chat.type != "private":
-        return await message.answer("Please use /delete_history in a private chat with the bot.")
-    args = command_args(message).lower().split()
-
-    if not args:
-        groups = await db(storage.imported_by_source)
-        total = sum(int(g["posts"]) for g in groups)
-        if not total:
-            return await message.answer("There are no imported posts to delete.")
-        rows = [
-            [InlineKeyboardButton(
-                text=f"🗑 {(g['title'] or 'forwarded / manual ' + str(g['chat_id']))[:30]} ({g['posts']})",
-                callback_data=f"dhq:s:{g['chat_id']}",
-            )]
-            for g in groups
-        ]
-        rows.append([InlineKeyboardButton(text=f"🗑 ALL imported ({total})", callback_data="dhq:a")])
-        rows.append([InlineKeyboardButton(text="Cancel", callback_data="dhn")])
-        return await message.answer(
-            "<b>Delete imported posts</b>\nTap what to delete:\n\n"
-            "One post or a range: <code>/delete_history SOURCE_ID ID</code> or "
-            "<code>/delete_history SOURCE_ID FIRST_ID LAST_ID</code>\n\n"
-            "This only removes posts from the bot. Nothing is deleted from your channels.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        )
-
-    confirm = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Yes, delete", callback_data="dhy:a"),
-        InlineKeyboardButton(text="Cancel", callback_data="dhn"),
-    ]])
-    if args == ["all"]:
-        count = await db(storage.count_history)
-        if not count:
-            return await message.answer("There are no imported posts to delete.")
-        return await message.answer(
-            f"Delete ALL <b>{count}</b> imported post(s) from the bot's library?\n"
-            "Posts collected live from your sources are kept.", reply_markup=confirm,
-        )
-
-    if len(args) not in (2, 3) or not all(a.lstrip("-").isdigit() for a in args[1:]) or args[1].startswith("-"):
-        return await message.answer(
-            "Format:\n<code>/delete_history</code> — choose from buttons\n"
-            "<code>/delete_history all</code>\n<code>/delete_history SOURCE_ID ID</code> — one post\n"
-            "<code>/delete_history SOURCE_ID FIRST_ID LAST_ID</code> — a range"
-        )
-    try:
-        source = int(args[0])
-    except ValueError:
-        chat = await resolve_chat(args[0])
-        source = chat.id if chat else None
-    if source is None:
-        return await message.answer("I cannot find that channel. Use its numeric ID (see /sources).")
-    first = int(args[1])
-    last = int(args[2]) if len(args) == 3 else first
-    if last < first:
-        return await message.answer("FIRST_ID must not be bigger than LAST_ID.")
-
-    count = await db(storage.count_history, source, first, last)
-    if not count:
-        return await message.answer("No saved posts with those IDs for that source.")
-    if first == last:  # a single post needs no confirmation
-        await db(storage.delete_history, source, first, last)
-        return await message.answer(f"Removed post {first} from the library. Nothing was deleted from the channel.")
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Yes, delete", callback_data=f"dhy:r:{source}:{first}:{last}"),
-        InlineKeyboardButton(text="Cancel", callback_data="dhn"),
-    ]])
-    await message.answer(f"Delete <b>{count}</b> post(s) with IDs {first}-{last} of <code>{source}</code> from the library?", reply_markup=keyboard)
-
-
-@dp.callback_query(F.data.startswith("dh"))
-async def delete_history_buttons(query: CallbackQuery):
-    if query.from_user.id not in all_admin_ids():
-        return await query.answer("Not authorized", show_alert=True)
-    data = query.data or ""
-    parts = data.split(":")
-    action = parts[0]
-    if action == "dhn":
-        await query.message.edit_text("Cancelled.")
-        return await query.answer()
-    try:
-        scope = parts[1]
-        source = first = last = None
-        if scope == "s":
-            source = int(parts[2])
-        elif scope == "r":
-            source, first, last = int(parts[2]), int(parts[3]), int(parts[4])
-        elif scope != "a":
-            return await query.answer()
-    except (ValueError, IndexError):
-        return await query.answer()
-
-    count = await db(storage.count_history, source, first, last)
-    if action == "dhq":
-        if scope == "a":
-            what = f"ALL <b>{count}</b> imported post(s)"
-        elif scope == "s":
-            what = f"<b>{count}</b> imported post(s) of <code>{source}</code>"
-        else:
-            what = f"<b>{count}</b> post(s) with IDs {first}-{last} of <code>{source}</code>"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Yes, delete", callback_data="dhy" + data[3:]),
-            InlineKeyboardButton(text="Cancel", callback_data="dhn"),
-        ]])
-        await query.message.edit_text(
-            f"Delete {what} from the bot's library?\n\n"
-            "Nothing is deleted from your channels, and posts already sent stay where they are.",
-            reply_markup=keyboard,
-        )
-    elif action == "dhy":
-        removed = await db(storage.delete_history, source, first, last)
-        library = await db(storage.library_size)
-        await query.message.edit_text(f"Removed {removed} post(s). Library now: {library} post(s).")
-    await query.answer()
 
 
 # ------------------------------------------------------- backup channel, snapshot file, restore
@@ -2038,7 +1848,6 @@ async def remove_admin_cmd(message: Message):
     if int(raw) in ADMIN_IDS:
         return await message.answer("Owners are set in the ADMIN_IDS variable and cannot be removed here.")
     if await db(storage.remove_admin, int(raw)):
-        IMPORTING.pop(int(raw), None)
         await clear_admin_menu(int(raw))
         await message.answer(f"Admin removed: <code>{raw}</code>.")
     else:
@@ -2098,12 +1907,7 @@ async def capture_admin_direct_post(message: Message):
             "Backup file received (not saved as a post). To restore from it, reply to this file with "
             "/import_backup  (owner only)."
         )
-    session = IMPORTING.get(message.from_user.id)
-    # While importing: save to the library only (no single destination queue) and stay quiet until /done.
-    qid = await db(queue_post, message, session is None, session is not None)
-    if session is not None:
-        session["added" if qid else "dup"] += 1
-        return
+    qid = await db(queue_post, message)
     if qid:
         await maybe_backup_live(qid)
         await message.reply("Post saved to the library and queued for one destination.")
@@ -2210,7 +2014,7 @@ async def run_alerts(chat_id: int, title: str):
             await notify_admins(
                 f"⚠️ <b>Low posts</b> for {escape(title)} (<code>{chat_id}</code>)\n"
                 f"Only <b>{value}</b> unused post(s) left before it starts repeating. "
-                "Add or import more posts (/import_history)."
+                "Add more posts (forward them to me or post in a source channel)."
             )
         elif kind == "all_used":
             await notify_admins(

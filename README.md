@@ -16,7 +16,6 @@ Saves every post from one source channel into a library and copies posts to your
 | `SOURCE_CHANNEL_IDS` | – | Source channel IDs, comma separated (`SOURCE_CHANNEL_ID` also works) |
 | `LOW_POST_THRESHOLD` | `10` | Low-post alert level (0 = off) |
 | `DAILY_REPORT_HOUR` | `8` | Daily report hour, local time (-1 = off) |
-| `MAX_IMPORT_RANGE` | `5000` | Max IDs per range import |
 | `BACKUP_DELAY_SECONDS` | `3` | Pause between backup/restore copies |
 | `AUTO_SNAPSHOT_HOURS` | `24` | Send the backup file to owners every N hours (0 = off) |
 | `MAX_RESTORE_RANGE` | `20000` | Max IDs per range restore |
@@ -78,14 +77,9 @@ Two layers protect you:
 
 Notes: the bot cannot read a channel's old posts by itself, so a post is only protected once it is in the backup channel. A backup file can hold about 50,000 posts (Telegram's 20 MB limit for bot downloads).
 
-## Multiple sources and old posts
-- Sources: set `SOURCE_CHANNEL_IDS` (comma separated) or use `/addsource -100…` (bot must be admin there), `/removesource`, `/sources`. New posts of every source are collected automatically.
-- **Old posts** — Telegram bots cannot read a channel's history by themselves, so there are two ways:
-  1. `/import_history` → forward the old posts to the bot (long-press a post, select many, Forward → bot) → `/done`. Posts forwarded from a source are matched by original ID, so duplicates are skipped.
-  2. `/import_history SOURCE_ID FIRST_ID LAST_ID` — adds a whole range of post IDs (max 5000 per command). IDs that do not exist are removed automatically when the bot tries to send them.
-  3. **5,000+ old posts, no manual forwarding:** run `tools/import_old_posts.py` once with your own Telegram account (it must be in `ADMIN_IDS`). It sends `/import_history`, forwards the whole channel history to the bot in small batches and sends `/done`, so the footer works on every post. The channel must already be a source (`/addsource`), forwarding must be allowed on it, and the bot must not be redeployed while it runs. New posts are collected live by the bot, so this is only for the backlog. Afterwards run `/backup` if you use a backup channel.
-- Imported posts join the library and are sent in the random rotation (no repeats until all were used).
-- **Undo / delete imported posts:** `/delete_history` shows buttons (per source, or ALL imported). Or type `/delete_history SOURCE_ID ID` (one post), `/delete_history SOURCE_ID FIRST LAST` (a range), `/delete_history all`. Everything except a single ID asks for confirmation. This only removes posts from the bot's library; nothing is deleted from your Telegram channels, and posts already sent stay where they are. Posts the bot collected live from a source are never touched by the per-source/all options.
+## Multiple sources
+- Sources: set `SOURCE_CHANNEL_IDS` (comma separated) or use `/addsource -100…` (bot must be admin there), `/removesource`, `/sources`. New posts of every source are collected automatically and sent in the random rotation (no repeats until all were used).
+- Old posts are not imported: the library holds the posts the bot saw while it was in the channel (plus any post an admin forwards to the bot, which is queued for one destination). A backup channel (`/setbackup`) and `/restore_posts` protect what is already in the library.
 
 ## Counts and alerts
 - `/stats` — library size per source, and per destination: sent in 24h, used, remaining, pending, cycles.
